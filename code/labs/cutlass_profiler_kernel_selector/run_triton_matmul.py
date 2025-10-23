@@ -1,0 +1,282 @@
+"""Optional Triton matmul runner to compare against CUTLASS profiler output."""
+# ruff: noqa: N803
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from pathlib import Path
+
+import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import arch_config  # noqa: E402,F401  # triggers triton_compat patch
+from labs.cutlass_profiler_kernel_selector.shapes import (  # noqa: E402
+    GemmShape,
+    transformer_gemm_shapes,
+)
+
+try:
+    import triton
+    import triton.language as tl
+
+    TRITON_AVAILABLE = True
+except Exception:  # pylint: disable=broad-except
+    TRITON_AVAILABLE = False
+
+
+ARTIFACT_DIR = REPO_ROOT / "artifacts" / "cutlass_profiler"
+# Inputs are standard normal, so each output element has standard deviation
+# sqrt(K). fp32 accumulation order and TF32 rounding of f32 inputs stay below
+# this bound. A dropped or repeated K tile exceeds it, and so does an unmasked
+# K tail that reads nonzero data.
+MAX_ABS_ERROR_PER_SQRT_K = 1e-2
+
+
+def _dtype_from_str(dtype: str) -> torch.dtype:
+    mapping = {
+        "f16": torch.float16,
+        "bf16": torch.bfloat16,
+        "f32": torch.float32,
+    }
+    if dtype not in mapping:
+        raise ValueError(f"Unsupported dtype {dtype}")
+    return mapping[dtype]
+
+
+if TRITON_AVAILABLE:
+
+    @triton.jit
+    def _matmul_kernel(
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """Simple block matmul kernel using Triton language (no triton.ops dependency)."""
+        pid_m = tl.program_id(axis=0)
+        pid_n = tl.program_id(axis=1)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+
+        a_block_ptr = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        b_block_ptr = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        k_remaining = K
+        a_ptrs = a_block_ptr
+        b_ptrs = b_block_ptr
+        while k_remaining > 0:
+            k_mask = offs_k < k_remaining
+            a = tl.load(
+                a_ptrs,
+                mask=(offs_m[:, None] < M) & k_mask[None, :],
+                other=0.0,
+            )
+            b = tl.load(
+                b_ptrs,
+                mask=k_mask[:, None] & (offs_n[None, :] < N),
+                other=0.0,
+            )
+            acc += tl.dot(a, b, out_dtype=tl.float32)
+            a_ptrs += BLOCK_K * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+            k_remaining -= BLOCK_K
+
+        c = acc
+        tl.store(
+            c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+            c,
+            mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+        )
+
+else:
+    _matmul_kernel = None
+
+
+def verify_triton_matmul_output(c: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> float:
+    """Check the timed Triton output against an fp32 torch.matmul reference.
+
+    Returns the max absolute error and raises when the output is wrong.
+    """
+    if a.dim() != 2 or b.dim() != 2 or a.shape[1] != b.shape[0]:
+        raise ValueError(f"Incompatible matmul inputs: a={tuple(a.shape)} b={tuple(b.shape)}")
+    expected_shape = (a.shape[0], b.shape[1])
+    if tuple(c.shape) != expected_shape:
+        raise RuntimeError(f"Triton matmul output shape {tuple(c.shape)} != expected {expected_shape}")
+    if not bool(torch.isfinite(c).all()):
+        raise RuntimeError("Triton matmul output contains non-finite values")
+    error = torch.matmul(a.float(), b.float())
+    error.sub_(c.float()).abs_()
+    max_abs_error = float(error.max())
+    limit = MAX_ABS_ERROR_PER_SQRT_K * math.sqrt(a.shape[1])
+    if max_abs_error > limit:
+        raise RuntimeError(
+            f"Triton matmul output does not match torch.matmul: max abs error "
+            f"{max_abs_error:.4g} exceeds {limit:.4g} (K={a.shape[1]})"
+        )
+    return max_abs_error
+
+
+def benchmark_triton_matmul(
+    shape: GemmShape, warmup: int, iters: int, dtype: torch.dtype
+) -> dict[str, float] | None:
+    if not torch.cuda.is_available() or not TRITON_AVAILABLE or _matmul_kernel is None:
+        return None
+
+    device = torch.device("cuda")
+    a = torch.randn((shape.m, shape.k), device=device, dtype=dtype)
+    b = torch.randn((shape.k, shape.n), device=device, dtype=dtype)
+    c = torch.empty((shape.m, shape.n), device=device, dtype=torch.float32)
+
+    def grid(meta):
+        return (
+            triton.cdiv(shape.m, meta["BLOCK_M"]),
+            triton.cdiv(shape.n, meta["BLOCK_N"]),
+        )
+
+    # Warmup/JIT compile
+    for _ in range(warmup):
+        _matmul_kernel[grid](
+            a,
+            b,
+            c,
+            shape.m,
+            shape.n,
+            shape.k,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            BLOCK_M=128,
+            BLOCK_N=128,
+            BLOCK_K=32,
+        )
+    torch.cuda.synchronize()
+
+    times_ms: list[float] = []
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream()
+    for _ in range(iters):
+        start.record(current_stream)
+        _matmul_kernel[grid](
+            a,
+            b,
+            c,
+            shape.m,
+            shape.n,
+            shape.k,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            BLOCK_M=128,
+            BLOCK_N=128,
+            BLOCK_K=32,
+        )
+        end.record(current_stream)
+        end.synchronize()
+        times_ms.append(start.elapsed_time(end))
+
+    if not times_ms:
+        return None
+
+    max_abs_error = verify_triton_matmul_output(c, a, b)
+    best_ms = min(times_ms)
+    flops = 2.0 * shape.m * shape.n * shape.k
+    tflops = flops / (best_ms * 1e-3) / 1e12
+    return {"runtime_ms": best_ms, "tflops": tflops, "max_abs_error": max_abs_error}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run Triton matmul on transformer-ish shapes.")
+    parser.add_argument("--output-dir", type=Path, default=ARTIFACT_DIR, help="Where to store JSON results.")
+    parser.add_argument("--warmup", type=int, default=5, help="Warmup iterations for Triton matmul.")
+    parser.add_argument("--iters", type=int, default=10, help="Measured iterations.")
+    parser.add_argument("--shapes", type=str, nargs="*", default=None, help="Subset of shape names to run.")
+    args = parser.parse_args(argv)
+
+    if not torch.cuda.is_available():
+        print("CUDA is not available; skipping Triton matmul.", file=sys.stderr)
+        return 1
+    if not TRITON_AVAILABLE:
+        print("Triton is not installed (or triton.language unavailable); install triton to run this comparison.", file=sys.stderr)
+        return 1
+
+    shapes = transformer_gemm_shapes()
+    if args.shapes:
+        name_set = set(args.shapes)
+        shapes = [s for s in shapes if s.name in name_set]
+    if not shapes:
+        print("No shapes selected.", file=sys.stderr)
+        return 1
+
+    dtype = _dtype_from_str(shapes[0].dtype)
+    results = []
+    failed = []
+
+    for shape in shapes:
+        print(f"→ Triton matmul {shape.name} (m={shape.m}, n={shape.n}, k={shape.k})")
+        try:
+            metrics = benchmark_triton_matmul(shape, args.warmup, args.iters, dtype)
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"   FAILED: {exc}", file=sys.stderr)
+            failed.append(shape.name)
+            continue
+
+        if metrics is None:
+            print("   No metrics produced.", file=sys.stderr)
+            failed.append(shape.name)
+            continue
+
+        print(
+            f"   runtime={metrics['runtime_ms']:.3f} ms, throughput={metrics['tflops']:.2f} TFLOP/s, "
+            f"max_abs_error={metrics['max_abs_error']:.3g}"
+        )
+        results.append(
+            {
+                **shape.as_dict(),
+                **metrics,
+                "provider": "triton",
+                "kernel": "custom_triton_matmul",
+            }
+        )
+
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "triton_matmul_results.json"
+    with output_path.open("w") as f:
+        json.dump({"provider": "triton", "results": results, "failed": failed}, f, indent=2)
+
+    print(f"\nTriton results written to {output_path}")
+    if failed:
+        print(f"{len(failed)} shape(s) failed: {', '.join(failed)}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

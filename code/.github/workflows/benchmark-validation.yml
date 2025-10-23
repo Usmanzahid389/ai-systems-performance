@@ -1,0 +1,2 @@
+# GitHub reads active workflows only from the repository-root .github/workflows directory.
+# The active definition is ../../../.github/workflows/benchmark-validation.yml.

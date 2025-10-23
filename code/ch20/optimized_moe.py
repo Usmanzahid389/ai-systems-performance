@@ -1,0 +1,142 @@
+"""optimized_moe.py - Minimal MoE-style benchmark for Chapter 20 tests."""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+import torch.nn as nn
+
+try:
+    import ch20.arch_config  # noqa: F401 - Apply chapter defaults
+except ImportError:
+    pass
+
+from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig, WorkloadMetadata
+from core.utils.compile_utils import compile_model
+
+
+class ToyMoe(nn.Module):
+    """Simplified MoE block with two experts and top-1 routing."""
+
+    def __init__(self, hidden_dim: int = 1024):
+        super().__init__()
+        self.output = None
+        self._verify_input = None
+        self.gate = nn.Linear(hidden_dim, 2, bias=False)
+        self.expert0 = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+        self.expert1 = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        top_expert = self.gate(x).argmax(dim=-1, keepdim=True)
+        out0 = self.expert0(x)
+        out1 = self.expert1(x)
+        route_expert0 = top_expert == 0
+        return torch.where(route_expert0, out0, out1)
+
+
+class OptimizedMoeBenchmark(VerificationPayloadMixin, BaseBenchmark):
+    """Exercise a tiny MoE forward pass with optional compilation."""
+
+    def __init__(self):
+        super().__init__()
+        self.model: Optional[nn.Module] = None
+        self.inputs: Optional[torch.Tensor] = None
+        self.batch = 32
+        self.hidden_dim = 1024
+        self._workload = WorkloadMetadata(
+            requests_per_iteration=float(self.batch),
+            tokens_per_iteration=float(self.batch),
+        )
+        self._verify_input: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self.output: Optional[torch.Tensor] = None
+        self._payload_parameter_count = 0
+
+    def setup(self) -> None:
+        model = ToyMoe(self.hidden_dim).to(self.device).half().eval()
+        self.model = compile_model(
+            model,
+            mode="reduce-overhead",
+            fullgraph=False,
+            dynamic=False,
+        )
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
+        self.inputs = torch.randn(self.batch, self.hidden_dim, device=self.device, dtype=torch.float16)
+        self._verify_input = self.inputs[0:1].clone()
+        self._verify_output_buffer = torch.empty_like(self._verify_input, dtype=torch.float32)
+        for _ in range(2):
+            with torch.inference_mode():
+                _ = self.model(self.inputs)
+
+    def benchmark_fn(self) -> None:
+        assert self.model is not None and self.inputs is not None
+        with self._nvtx_range("optimized_moe"):
+            with torch.inference_mode():
+                _ = self.model(self.inputs)
+
+    def capture_verification_payload(self) -> None:
+        if self._verify_input is None or self.model is None or self._verify_output_buffer is None:
+            raise RuntimeError("setup() must prepare verify input before verification")
+        with torch.inference_mode():
+            verify_output = self.model(self._verify_input)
+            self._verify_output_buffer.copy_(verify_output)
+            self.output = self._verify_output_buffer
+        self._set_verification_payload(
+            inputs={"verify_input": self._verify_input},
+            output=self.output,
+            batch_size=int(self._verify_input.shape[0]),
+            parameter_count=self._payload_parameter_count,
+            output_tolerance=(0.1, 1.0),
+        )
+
+    def teardown(self) -> None:
+        self.model = None
+        self.inputs = None
+        self._verify_input = None
+        self._verify_output_buffer = None
+        self.output = None
+        torch.cuda.empty_cache()
+
+    def get_config(self) -> BenchmarkConfig:
+        return BenchmarkConfig(
+            iterations=10,
+            warmup=10,
+            use_subprocess=True,
+        )
+
+    def get_workload_metadata(self) -> Optional[WorkloadMetadata]:
+        return self._workload
+
+    def get_custom_metrics(self) -> Optional[dict]:
+        """Return domain-specific metrics using standardized helper."""
+        from core.benchmark.metrics import compute_ai_optimization_metrics
+        return compute_ai_optimization_metrics(
+            original_time_ms=None,
+            ai_optimized_time_ms=getattr(self, '_last_elapsed_ms', None),
+            suggestions_applied=None,
+            suggestions_total=None,
+        )
+
+    def validate_result(self) -> Optional[str]:
+        if self.model is None:
+            return "Model not initialized"
+        if self.inputs is None:
+            return "Input tensor not initialized"
+        return None
+
+    def get_verify_output(self) -> torch.Tensor:
+        return super().get_verify_output()
+
+
+def get_benchmark() -> BaseBenchmark:
+    return OptimizedMoeBenchmark()

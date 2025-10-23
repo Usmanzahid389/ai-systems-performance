@@ -1,0 +1,167 @@
+"""Baseline vLLM dual-pool benchmark: shared prefill/decode pool."""
+
+from __future__ import annotations
+
+from typing import Dict, Optional
+
+import torch
+
+from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig
+from labs.dynamic_router import vllm_runner
+from labs.dynamic_router.topology import detect_topology
+from labs.dynamic_router.verification import (
+    metric_row_buffer,
+    numeric_metric_values,
+    require_verification_output,
+    scalar_int_buffer,
+)
+from labs.dynamic_router.vllm_runner import run_dual_pool_vllm_with_topology
+
+
+class BaselineDualPoolVllmBenchmark(VerificationPayloadMixin, BaseBenchmark):
+    """Runs vLLM in a shared-pool configuration (prefill and decode on the same GPUs)."""
+
+    # vLLM admission consumes Python token lists. Rebuild them from the live
+    # CPU input each invocation so verification mutations reach the engine.
+    # _split_prompt_token_ids rejects GPU inputs before host conversion.
+    allowed_benchmark_fn_antipatterns = ("host_transfer",)
+    multi_gpu_required = True
+    _is_deterministic = True
+    input_jitter_bounds = {"prompt_token_ids": (0, 2)}
+    profile_require_teardown = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._summary: Dict[str, float] = {}
+        self.output: Optional[torch.Tensor] = None
+        self._metric_values: Optional[list[float]] = None
+        self._metric_output_buffer: Optional[torch.Tensor] = None
+        self._mode_input: Optional[torch.Tensor] = None
+        self._prompt_token_ids: Optional[torch.Tensor] = None
+        self._cli_args = vllm_runner._CLI_ARGS
+        self._target_override_error: Optional[str] = None
+        self._prompt_lengths: list[int] = []
+        self._topology = None
+        self._engine_session: Optional[vllm_runner.VllmEngineSession] = None
+        self._summary_ready = False
+        self._configure_cli_args(self._cli_args)
+
+    def _configure_cli_args(self, cli_args) -> None:
+        self._cli_args = cli_args
+        self._prompt_lengths = vllm_runner.dual_pool_prompt_lengths(cli_args)
+        request_count = len(self._prompt_lengths)
+        self.register_workload_metadata(
+            requests_per_iteration=float(request_count),
+            tokens_per_iteration=float(
+                sum(self._prompt_lengths)
+                + request_count * max(1, cli_args.max_tokens)
+            ),
+        )
+
+    def apply_target_overrides(self, argv: list[str]) -> None:
+        """Apply one exact ``--target-extra-arg`` vector before setup."""
+        if self._engine_session is not None:
+            raise RuntimeError("vLLM target overrides must be applied before setup()")
+        try:
+            cli_args = vllm_runner.parse_vllm_target_overrides(argv)
+        except ValueError as exc:
+            self._target_override_error = str(exc)
+            raise
+        self._target_override_error = None
+        self._configure_cli_args(cli_args)
+
+    def setup(self) -> None:
+        if self._target_override_error is not None:
+            raise ValueError(f"Invalid target override: {self._target_override_error}")
+        self._mode_input = scalar_int_buffer(self, "_mode_input", 0)
+        self._prompt_token_ids = vllm_runner.build_prompt_token_ids(
+            self._prompt_lengths
+        )
+        self._topology = detect_topology(max_gpus=torch.cuda.device_count())
+        vllm_runner.emit_vllm_profile_runtime_receipt(
+            type(self).__name__, self._cli_args
+        )
+        self._engine_session = vllm_runner.create_dual_pool_vllm_session(
+            "shared",
+            topology_snapshot=self._topology,
+            cli_args=self._cli_args,
+            warmup_runs=vllm_runner.WARMUP_ITERATIONS,
+        )
+
+    def benchmark_fn(self) -> None:
+        if self._mode_input is None or int(self._mode_input[0]) != 0:
+            raise RuntimeError("setup() must initialize shared-pool routing mode")
+        if self._prompt_token_ids is None:
+            raise RuntimeError("setup() must initialize live prompt-token input")
+        if self._engine_session is None:
+            raise RuntimeError("setup() must initialize reusable vLLM engines")
+        self._summary = run_dual_pool_vllm_with_topology(
+            "shared",
+            topology_snapshot=self._topology,
+            cli_args=self._cli_args,
+            prompt_token_ids=self._prompt_token_ids,
+            engine_session=self._engine_session,
+        )
+        self._summary_ready = True
+
+    def capture_verification_payload(self) -> None:
+        if not self._summary_ready:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        if self._prompt_token_ids is None:
+            raise RuntimeError("setup() must initialize live prompt-token input")
+        require_verification_output(self._summary)
+        metric_values = numeric_metric_values(self._summary, self._metric_values)
+        self._metric_values = metric_values
+        self.output = metric_row_buffer(self, metric_values)
+        self._set_verification_payload(
+            inputs={
+                "prompt_token_ids": self._prompt_token_ids,
+                "mode": scalar_int_buffer(self, "_mode_input", 0),
+            },  # shared
+            output=self.output,
+            batch_size=1,
+            parameter_count=0,
+            precision_flags={"fp16": False, "bf16": False, "tf32": False},
+            output_tolerance=(0.0, 0.0),
+        )
+
+    def teardown(self) -> None:
+        receipt_error: Optional[Exception] = None
+        if self._summary_ready:
+            try:
+                vllm_runner.emit_vllm_profile_output_receipt(
+                    type(self).__name__, self._cli_args, self._summary
+                )
+            except Exception as exc:
+                receipt_error = exc
+        if self._engine_session is not None:
+            self._engine_session.close()
+            self._engine_session = None
+        self.output = None
+        self._metric_values = None
+        self._metric_output_buffer = None
+        self._mode_input = None
+        self._prompt_token_ids = None
+        self._topology = None
+        self._summary_ready = False
+        super().teardown()
+        if receipt_error is not None:
+            raise receipt_error
+
+    def get_config(self) -> Optional[BenchmarkConfig]:
+        return BenchmarkConfig(
+            iterations=vllm_runner.STEADY_STATE_ITERATIONS,
+            warmup=vllm_runner.WARMUP_ITERATIONS,
+            adaptive_iterations=False,
+            timing_method="wall_clock",
+            multi_gpu_required=True,
+        )
+
+    def get_custom_metrics(self) -> Optional[Dict[str, float]]:
+        return self._summary or None
+
+
+def get_benchmark() -> BaseBenchmark:
+    """Factory for discover_benchmarks()."""
+    return BaselineDualPoolVllmBenchmark()

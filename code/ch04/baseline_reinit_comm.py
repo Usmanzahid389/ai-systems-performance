@@ -1,0 +1,171 @@
+"""Recreate a one-rank NCCL communicator for every benchmark iteration.
+
+The default standalone case measures local communicator lifecycle overhead. It
+does not measure network communication performance. A real torchrun context is
+still honored when the benchmark is launched under one.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+import torch.distributed as dist
+
+from ch04.reinit_comm_common import (
+    ReinitCommLaunchContext,
+    initialize_reinit_process_group,
+    resolve_reinit_comm_launch,
+)
+from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.harness.benchmark_harness import (
+    BaseBenchmark,
+    BenchmarkConfig,
+    WorkloadMetadata,
+)
+
+
+class BaselineReinitCommBenchmark(VerificationPayloadMixin, BaseBenchmark):
+    """Reinitialize the default one-rank NCCL communicator every iteration."""
+
+    multi_gpu_required = False
+
+    def __init__(self):
+        super().__init__()
+        self.rank = 0
+        self.world_size = 1
+        self.local_rank = 0
+        self.input_tensor = None
+        self.tensor = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._launch_context: ReinitCommLaunchContext | None = None
+        self._standalone_store: dist.Store | None = None
+        self.initialized = False
+        self._workload = WorkloadMetadata(
+            requests_per_iteration=1.0,
+            bytes_per_iteration=4.0,  # single float all-reduce
+        )
+
+    def setup(self) -> None:
+        """Configure a standalone rank or preserve a real torchrun context."""
+        self._launch_context = resolve_reinit_comm_launch("baseline_reinit_comm")
+        self.rank = self._launch_context.rank
+        self.world_size = self._launch_context.world_size
+        self.local_rank = self._launch_context.local_rank
+        self.device = torch.device(f"cuda:{self.local_rank}")
+        torch.cuda.set_device(self.local_rank)
+        # Intentionally tiny payload: this benchmark isolates communicator reinit overhead,
+        # not bandwidth. Larger tensors would dilute the init/destroy cost.
+        self.input_tensor = torch.randn(1, 1, device=self.device, dtype=torch.float32)
+        self.tensor = torch.empty_like(self.input_tensor)
+        self._verify_output_buffer = torch.empty_like(self.tensor)
+        self._synchronize()
+        self.register_workload_metadata(
+            requests_per_iteration=self._workload.requests_per_iteration,
+            bytes_per_iteration=self._workload.bytes_per_iteration,
+        )
+
+    def benchmark_fn(self) -> None:
+        """Benchmark: Reinitialize NCCL every iteration."""
+        if self.tensor is None or self.input_tensor is None:
+            raise RuntimeError("Tensor not initialized")
+        if self._launch_context is None:
+            raise RuntimeError("Communicator launch context not initialized")
+        with self._nvtx_range("reinit_comm"):
+            # Anti-pattern: reinitialize NCCL every iteration
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            self._standalone_store = None
+
+            torch.cuda.set_device(self.local_rank)
+            self._standalone_store = initialize_reinit_process_group(
+                self._launch_context,
+                backend="nccl",
+                device_id=self.device,
+            )
+
+            # Perform all-reduce
+            self.tensor.copy_(self.input_tensor)
+            dist.all_reduce(self.tensor)
+
+    def capture_verification_payload(self) -> None:
+        if (
+            self.input_tensor is None
+            or self.tensor is None
+            or self._verify_output_buffer is None
+        ):
+            raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.tensor)
+        self._set_verification_payload(
+            inputs={"input": self.input_tensor},
+            output=self._verify_output_buffer,
+            batch_size=int(self.input_tensor.shape[0]),
+            parameter_count=0,
+            precision_flags={
+                "fp16": False,
+                "bf16": False,
+                "fp8": False,
+                "tf32": torch.backends.cuda.matmul.allow_tf32 if torch.cuda.is_available() else False,
+            },
+            output_tolerance=(1e-6, 1e-6),
+        )
+
+
+    def teardown(self) -> None:
+        """Teardown: Clean up resources."""
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        self._standalone_store = None
+        self._launch_context = None
+        self.input_tensor = None
+        self.tensor = None
+        self._verify_output_buffer = None
+        super().teardown()
+
+    def get_config(self) -> BenchmarkConfig:
+        """Return benchmark configuration."""
+        return BenchmarkConfig(
+            iterations=5,
+            warmup=5,
+            enable_memory_tracking=False,
+            enable_profiling=False,
+        )
+
+    def get_custom_metrics(self) -> Optional[dict]:
+        """Return domain-specific metrics using standardized helper."""
+        from core.benchmark.metrics import compute_memory_transfer_metrics
+        return compute_memory_transfer_metrics(
+            bytes_transferred=self._bytes_transferred if hasattr(self, '_bytes_transferred') else float(getattr(self, 'N', 1024) * 4),
+            elapsed_ms=getattr(self, '_last_elapsed_ms', None),
+            transfer_type="hbm",
+        )
+
+    def validate_result(self) -> Optional[str]:
+        """Validate benchmark result."""
+        if self.tensor is None:
+            return "Tensor not initialized"
+        if not dist.is_initialized():
+            return "Distributed process group not initialized"
+        # Check tensor shape and values
+        if self.tensor.shape != (1, 1):
+            return f"Tensor shape mismatch: expected (1, 1), got {self.tensor.shape}"
+        if not torch.isfinite(self.tensor).all():
+            return "Tensor contains non-finite values"
+        return None
+
+    def get_verify_output(self) -> torch.Tensor:
+        """Return output tensor for verification comparison."""
+        return super().get_verify_output()
+
+    def get_input_signature(self) -> dict:
+        """Return input signature for verification."""
+        return super().get_input_signature()
+
+    def get_output_tolerance(self) -> tuple:
+        """Return tolerance for numerical comparison."""
+        return (1e-6, 1e-6)
+
+
+def get_benchmark() -> BaseBenchmark:
+    """Factory function for benchmark discovery."""
+    return BaselineReinitCommBenchmark()

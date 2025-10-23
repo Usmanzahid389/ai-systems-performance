@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-16",
+  "qualification": "noncanonical_virtualized_host_exploration",
+  "source_base_commit": "0299307fa",
+  "upstream_revision": "2dfe5e26aecfd9e5f27bf9d5837deea01acda24b",
+  "hardware": {
+    "gpu": "NVIDIA B200",
+    "compute_capability": "10.0",
+    "visible_gpus": 1,
+    "virtualized": true,
+    "cuda_toolkit": "13.0.88",
+    "pytorch": "2.9.1+cu130",
+    "sm_clock_mhz": 1965,
+    "memory_clock_mhz": 3996
+  },
+  "measurement": {
+    "profile": "deep_dive",
+    "validity_profile": "strict",
+    "requested_iterations": 20,
+    "requested_warmup": 5,
+    "protocol": "repository harness with fixed resident buffers. The blog rotates inputs and alternates kernel order."
+  },
+  "native_sources_sha256": {
+    "h100_reduction_kernels.cu": "a8d786df751482c5a431b22b279548adbed09600621a167ca578d701e44aed48",
+    "h100_gemm_extension.cu": "a6bcfd722a6f8aef626e907cba03481b954894cb1b19bd8e88cea99ac3918467",
+    "nvfp4_native.cu": "2ae5c0b8bb5b8a6e60adae4e28ab5541e072c269144aea62d3eb89d405f066be",
+    "b200_epilogue.cu": "806f6226b44b6f1cd99a8e944650ae58571ee4647fb3b1b1d5163e2bb283d920"
+  },
+  "results": [
+    {
+      "target": "labs/fast_cu:int32_reduction",
+      "status": "failed_no_speedup",
+      "baseline_ms": 0.1883358495159113,
+      "candidate_ms": 0.1801341006920921,
+      "speedup": 1.0455313502124657,
+      "minimum_required_speedup": 1.05,
+      "input_verification": true,
+      "output_verification": true,
+      "baseline_profilers": {
+        "nsys": "succeeded",
+        "ncu": "succeeded",
+        "torch": "succeeded"
+      },
+      "candidate_profilers": {
+        "nsys": "succeeded",
+        "ncu": "succeeded",
+        "torch": "succeeded"
+      },
+      "source_result_sha256": "b8cec133bd9b886311f8784d938783b46f91a0a4726c90c61fa4129a38f501f2",
+      "speedup_threshold_source": "repository harness default. The raw expectation override was null"
+    },
+    {
+      "target": "labs/fast_cu:b200_epilogue",
+      "status": "succeeded",
+      "baseline_ms": 0.05168658194423338,
+      "candidate_ms": 0.048537385734480486,
+      "speedup": 1.0648818670824238,
+      "minimum_required_speedup": 1.05,
+      "input_verification": true,
+      "output_verification": true,
+      "baseline_profilers": {
+        "nsys": "succeeded",
+        "ncu": "succeeded",
+        "torch": "succeeded"
+      },
+      "candidate_profilers": {
+        "nsys": "succeeded",
+        "ncu": "succeeded",
+        "torch": "succeeded"
+      },
+      "source_result_sha256": "6a63865270a5fdfbb5a652e028bce169a68f565855caf427b2fb181fe01be4ec",
+      "speedup_threshold_source": "repository harness default. The raw expectation override was null"
+    }
+  ],
+  "limitations": [
+    "No H100 runtime validation",
+    "No SM103 runtime validation",
+    "No published speedup or expectation baseline from this single exploratory run"
+  ],
+  "compile_only_checks": {
+    "nvfp4": {
+      "status": "passed",
+      "rungs": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "cuda_compiler": "13.1.80",
+      "cuda_architecture": "compute_103a,sm_103a",
+      "pytorch": "2.9.1+cu130",
+      "compiled_linked_and_imported": true,
+      "modules_coexisting_in_one_process": 10,
+      "gpu_visible": false,
+      "kernels_executed": false,
+      "qualification": "build_only_not_sm103_runtime_validation",
+      "source_log_sha256": "91deed619c03dbee5414c0d7116e156632cf471522536b26bd928d4aea4643e8",
+      "cublas_package": "nvidia-cublas 13.0.0.19",
+      "runtime_headers_and_cudart": "CUDA 13.1.80",
+      "aggregate_compile_link_import_seconds": 277.093
+    },
+    "h100_gemm": {
+      "status": "passed",
+      "cuda_compiler": "13.0.88",
+      "cuda_architecture": "compute_90a,sm_90a",
+      "compiled_and_linked": true,
+      "kernels_executed": false,
+      "source_log_sha256": "ef5df84edf243e7d4c22265433267a2357348016f36b10c4030135f04ffbf89b",
+      "includes_local_schedule_assertion_fixes": true
+    }
+  },
+  "local_source_patch_validation": {
+    "upstream_base": "2dfe5e26aecfd9e5f27bf9d5837deea01acda24b",
+    "gpu": "NVIDIA B200",
+    "compute_capability": "10.0",
+    "cuda_compiler": "13.0.88",
+    "reduction_default_elements": 1073741824,
+    "reduction_iterations_per_variant": 100,
+    "reduction_variants": 5,
+    "reference_and_all_results": 536860779,
+    "poisoned_output_regression_launches": 24,
+    "negative_cases_expected_exit_code": 1,
+    "negative_cases": [
+      "kernel_mismatch",
+      "cub_mismatch",
+      "invalid_length",
+      "invalid_kernel",
+      "no_cuda"
+    ],
+    "h100_debug_and_release_compile": "passed_sm_90a",
+    "scheduler_host_checks": {
+      "headers": 2,
+      "shapes": 6,
+      "build_modes": 2,
+      "status": "passed"
+    },
+    "h100_gpu_kernels_executed": false,
+    "source_sha256": {
+      "h100/sum.cu": "149b5cc520c3f6f4313857d1bee303b52699b35c6b60576f3d16f0dc6d839a40",
+      "h100/matmul/matmul_11.cuh": "0e9d5f76674a1335927558b011af374c067c958c5aaba1b99b8cb90617a46fe9",
+      "h100/matmul/matmul_12.cuh": "a6ba5315e414a32460bbf8cfcc5b7190b2a4935c42ae6c46420f00ffd030920d"
+    },
+    "evidence_log_sha256": {
+      "b200-reduction.log": "ca1997e8ddc3d03ab310aa85cefc9e4901e203919b99b77b45ba5dd1760bd71e",
+      "h100-scheduler-checks.log": "ec5cdc7605b5434f96163228233b93069f2c8e55aff292470cca91c38ff178c1",
+      "negative-reduction-tests.log": "eac8d4c642b00b28ba241fe37d336587ce2090a40400e350bb97a6d1f4e5e9c9",
+      "no-gpu-failure.log": "a67bc2b60d12e1225cc7e15d3fcfd5acca69e8e0fa0f5e5d350312d86abc039d",
+      "upstream-debug-negative-control.log": "8ba1b0e43388b0bde7cd8dac8448a53ab47a8a5bfb4599ed93713b0a5cba361b"
+    },
+    "integration_b200_tests": {
+      "passed": 66,
+      "skipped": 2
+    },
+    "integration_cpu_tests": {
+      "passed": 63,
+      "skipped": 5
+    }
+  }
+}

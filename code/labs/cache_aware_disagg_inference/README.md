@@ -1,0 +1,51 @@
+# Lab - Cache-Aware Disaggregated Inference
+
+## Summary
+Recreates the article-level scheduler story behind cache-aware prefill/decode disaggregation: a cache-unaware round-robin baseline versus cache-affine decode placement with a shared KV hierarchy and a warm/cold request mix.
+
+## Problem
+Naive prefill/decode disaggregation makes the topology look correct while still wasting locality. If chunk handoff bounces each request across decode workers, warm prefixes stop being warm and KV reload traffic overwhelms the supposed benefit of disaggregation.
+
+## Baseline Path
+- round-robin logical decode placement
+- shared-prefix reloads whenever chunk ownership changes
+- a useful control for showing how temporal locality gets destroyed
+
+## Optimized Path
+- cache-affine worker assignment
+- warm prefixes stay resident on the same logical decode worker
+- the benchmark reports cache hit rate, KV transfer volume, worker switches, and TTFT/TPOT so the win is explained, not just timed
+
+## Learning Goals
+- Compare cache-unaware round-robin handoff against cache-aware decode affinity.
+- Make temporal and spatial locality visible through custom metrics rather than narrative alone.
+- Keep the lab runnable on one GPU by simulating logical workers instead of requiring a full cluster.
+
+## Directory Layout
+| Path | Description |
+| --- | --- |
+| `baseline_cache_aware_disagg.py`, `optimized_cache_aware_disagg.py`, `cache_aware_disagg_common.py` | Single-GPU logical-worker benchmark pair plus the shared scheduler/cache model that reproduces the article's core behavior. |
+
+## Running the Benchmarks
+Use the benchmark harness for quick comparisons or drive the Typer CLI when you need repeatable artifact capture.
+```bash
+python -m cli.aisp bench list-targets --chapter labs/cache_aware_disagg_inference
+python -m cli.aisp bench run --targets labs/cache_aware_disagg_inference --profile minimal
+```
+- Targets follow the `labs/cache_aware_disagg_inference:<workload>` naming convention listed by `list-targets`.
+- `--target-extra-arg labs/cache_aware_disagg_inference:<workload>="--flag value"` passes arguments to one target. The harness fails the target unless the benchmark defines `apply_target_overrides` or launches through torchrun.
+- Benchmark validity profile defaults to strict. Virtualization is warning-only; use `--validity-profile portable` for broader compatibility on hardware-limited environments.
+- Portable runs do not write expectation files unless `--allow-portable-expectations-update` is also provided.
+
+## Validation Checklist
+- `python -m cli.aisp bench run --targets labs/cache_aware_disagg_inference --profile minimal` compares the cache-unaware and cache-aware paths through the standard harness.
+- `python -m cli.aisp bench run --targets labs/cache_aware_disagg_inference:cache_aware_disagg --profile minimal` emits the round-robin baseline and cache-affine optimized metrics through one harness artifact set.
+- The cache-aware path should report lower KV transfer volume and fewer worker switches than the round-robin baseline on the same warm/cold request mix.
+
+## Notes
+- With two GPUs, the distributed target has one prefill and one decode rank. Both placement policies select the same decode rank, so this topology cannot demonstrate a reduction in migrations between decode ranks. September 7, 2026 repeated ABBA measurements on two B200s passed every full 2,048-element output comparison but found no speedup: median 14.331648 ms baseline and 14.499441 ms optimized (0.988428x; eight observations per arm, four fresh seeds). Standard deviations were 0.470046 and 0.517233 ms. These portable, unlocked observations did not reproduce the earlier single live-input run's 1.64306x. Both-arm Nsight traces are retained. Use at least two decode ranks to investigate migration benefits; this topology cannot establish that mechanism.
+- Multi-GPU results now expose `cache_aware.decode_rank_count`, `cache_aware.affinity_opportunity_count`, and `cache_aware.affinity_placement_distinguishable`. A direct 1P1D run is classified as a comparison surface. The optimized 1P1D path removes redundant global barriers between blocking point-to-point transfers while preserving the final per-request drain; `cache_aware.direct_1p1d_sync_fast_path` and `cache_aware.global_barriers_avoided_per_request` identify that separate synchronization mechanism. Its performance effect remains unmeasured until a repeated B200 rerun with full-output checks and retained traces.
+- This lab is intentionally a logical reproduction of the scheduler/caching story, not a full serving engine.
+- Treat single-GPU `cache_aware_disagg` as a locality-comparison benchmark with a local comparison contract. The stable value on one GPU is the cache hit rate, KV transfer volume, and worker affinity improvement; the timed delta is recorded, but it is not a trustworthy headline speed gate on this host.
+- Judge the single-GPU target by cache hit rate, KV transfer volume, and worker affinity before raw wall-clock speedup.
+- The defaults model chunked prefill, warm/cold requests, and a 2P1D-style comparison problem without forcing an 8-GPU host.

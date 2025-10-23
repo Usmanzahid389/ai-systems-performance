@@ -1,0 +1,2179 @@
+# Codebase repair checkpoint
+
+This change repairs benchmark correctness, profiler lifecycle and reporting,
+distributed launch behavior, and environment diagnostics. It is a validated
+repair checkpoint, not a claim that every example is maximally fast or that the
+complete hardware matrix has passed.
+
+The latest follow-up is [Waves52–53](#waves5253-normal-router-runs-and-the-final-integrated-suite).
+Earlier pending statements below record the state of those attempts; the later
+entries resolve them where fresh execution is available. Final integrated GPU
+tests, hosted CI, and the remaining merges are still pending.
+
+## Main repairs
+
+- Preserve real numerical verification and equivalent workloads in block
+  scaling, KV-cache compression, attention, MoE, and distributed examples.
+- Fix BF16-to-FP8 double rounding in KV-cache quantization. A one-dimensional
+  FP32 scale requests FP32 multiplication while retaining the preallocated FP8
+  output. The existing tolerance and timed workload are unchanged.
+- Validate complete Nsight Compute application-range captures, bind their
+  provenance to the actual report, and keep descriptive range duration separate
+  from kernel timing and benchmark speedup across the CLI, MCP and summaries.
+- Improve CUDA/NVSHMEM bounds and lifecycle checks, process cleanup, device
+  visibility handling, and structured unsupported-environment diagnostics.
+- Keep ordinary examples runnable through Python or local `torchrun`.
+  Slurm is optional; a scheduler can reserve one allocation for a whole sweep.
+  Direct all-reduce runs now use unique artifact names without a Slurm job ID.
+
+## Retained validation
+
+The integrated CPU run before the final small KV/portability corrections
+collected 5,084 tests: 4,600 passed, 481 skipped, and three failed because the
+local Torch 2.8 runtime lacks the expected precision API. Those failures remain
+recorded; this is not a full-suite pass. Static checks covered 2,788 Python files
+and 161 shell files. The final KV-focused local suite passed nine tests and
+skipped four CUDA-only tests.
+
+Actual execution on a shared, virtualized two-B200 host with Torch 2.9.1 and
+CUDA 13 confirmed full block-scaling numerical checks and profiler/report
+collection, plus both two-rank serving regressions. The standalone public CLI
+application-range capture passed with all five requested metrics, the complete
+selected NVTX range, exact report provenance and verified child runtimes.
+Every completed stage's owned processes drained.
+
+The original KV output check failed. A reduced real-class B200 diagnostic
+reproduced 31,600 tolerance violations with identical inputs; explicit FP32
+multiplication removed all violations without changing tolerance. The correction then passed all 13 append-path tests and full default-workload
+input/output verification on the B200. That replay still ended as a profiler
+failure: sidecar materialization incorrectly applied a 16 MiB source-file
+limit to the valid 41,843,422-byte optimized NCU capture. The repair separates
+streamed artifact hashing from source-worker limits and prevents failed
+required captures from updating saved expectations. Retained-report
+reprocessing and the complete merged-revision replay remain separate gates.
+The reported memory saving and single-pair timings are not accepted
+performance wins while required validation remains incomplete.
+
+## Remaining work
+
+### September 6 direct execution follow-up
+
+PR #15 merged as `c40767b8294d0471082aea9cfb8f5636b8961aec`. The final
+candidate's hosted CPU suite completed with 4,598 passed, 492 skipped, and no
+failures or errors (5,090 collected). Static, dashboard, and native build checks
+also passed. Both retained KV NCU reports were successfully reprocessed after
+the large-artifact hashing repair; the original interrupted/failed runs retain
+their original status.
+
+The unfiltered GPU test suite ran directly on the two-B200 host on
+September 6 starting at 10:05:44 UTC, using the clean merged source, Torch
+2.9.1+cu130, and `python -m pytest tests -q --tb=short`. It completed in
+1,831.28 seconds: **5,008 passed, 77 skipped, and 5 failed**. Two-rank NCCL
+tests executed. One failure selected system CMake 3.28.3 instead of the
+already-installed 3.31.10; four process-lifecycle checks encountered exited
+children retained as zombies by the outer validation supervisor until final
+drain. The supervisor ultimately drained all owned processes. All five tests
+then passed on the same merged source in 26.31 seconds after selecting CMake
+3.31.10 and reaping the supervisor's adopted, exited children during execution.
+Both receipts are retained: the original full run remains failed, and the
+targeted rerun passed and drained its processes. No Slurm allocation is required.
+The subsequent example
+inventory includes benchmark pairs, registered demos, and tools; the pytest
+suite alone does not establish that all of those entrypoints executed.
+
+PR #16 (`7b7728a8dd043a1e9a07a29565626dfed89c8984`) adds explicit optional
+device-identity and evaluation contracts, and distributed workload metadata.
+It merged as `3d7982a8860506505d1ca24b8c3754f3826fdba1` after CPU validation,
+dashboard, static analysis, and dual-architecture native build checks passed.
+Its 86 focused contract tests passed on the B200 host with no skips in 9.29
+seconds. Declared collective algorithms are not profiler observations,
+and dataset hashes do not prove semantic freedom from contamination.
+
+The integrated local contract/harness suite passed 172 tests and skipped 24
+hardware/platform cases. Evaluation receipts now originate in the actual worker,
+survive subprocess serialization on failure, and finalize after teardown; source
+or threshold drift rejects timing results. The default 873-file benchmark lint
+scan passed without errors or warnings.
+
+Discovery confirmed 486 benchmark targets, 29 demos, and 34 tools. Ten registered
+demo/tool paths previously had factories but no invoked workload entrypoint;
+they now invoke their actual standalone execution paths. Real CLI tests with
+CUDA hidden reject execution with explicit diagnostics rather than exiting
+successfully after import. These remain
+demo/tool runs, not baseline-versus-optimized performance evidence.
+
+The broad sweep exposed two practical continuation gaps: aggregate preflight can
+reject a whole bucket, and an exception escaping a chapter can abort later
+chapters. The direct validation queue therefore gives each target a separate
+process and result record, continues on nonzero exits, and preserves earlier
+results. Native tier-1, cluster, and fabric entrypoints run separately from this
+486-target pass. A follow-up repair now isolates explicit filtered targets when
+continuation is requested, records preflight failures and ordinary exceptions,
+and proceeds to later units. Its 78 focused and existing regression tests passed.
+Run-level aborts still propagate. Batch target resolution and contiguous-prefix
+native resume accounting remain improvement items.
+
+The first direct demo pass attempted all 29 registered demos: 23 exited
+successfully and six required follow-up. One requires GB10 coherent memory;
+two need explicit workload arguments; the other three exposed a TMA alignment
+failure, a CUTLASS dependency preflight failure, and a distributed launcher
+selecting another environment's Python through `PATH`. Tools also began
+executing. Completed results were preserved before replacing the coordinator
+to resume with corrected source and arguments.
+
+The launcher repair uses the selected Python's `torch.distributed.run` for demos
+and profiler workers, matching benchmark timing. A real two-worker identity test
+passes even with another environment's `torchrun` first on `PATH`. The combined
+launcher and TMA static contract selection passed 82 tests with two skips.
+The CUDA alignment repair then passed the actual production kernel's three
+full-output and canary shapes under Compute Sanitizer with zero reported errors,
+and the original 2048-square demo completed. The focused B200 regression
+selection passed 90 tests with no skips. The initial standalone validator
+compile exposed a separate flag defect: `-arch=sm_100a` emits generic PTX as well;
+the architecture-specific caller requires an explicit `compute_100a` to
+`sm_100a` code-generation target. The launcher, alignment, and continuation
+repairs are committed in `a738687c28c10161e3000a97ce2ed640795872b6`; they are
+included in PR #17, which merged as
+`cd35b3bd36970a5dcf3b91f89d5a317b3adb80d7` after all four hosted checks passed.
+The validator code-generation flag repair is included in that merge.
+
+CI's broader `--include-unpaired --fail-on-warnings` lint scan also passed:
+932 files, zero errors and warnings. The contract checker recognizes exact
+registered demo/tool paths as standalone entrypoints while continuing to reject
+`__main__` blocks in paired benchmark modules.
+
+### Resumed examples and measured KV graph candidate
+
+The resumed queue uses clean source
+`57e754fe5eb87d8669e800a0dca3e05bef31a1aa`, retaining prior source identities
+for reused results. All 29 registered demos and 34 tools have been attempted.
+The reconciled exit counts are 25 successful demo exits and four nonzero exits,
+and 32 successful tool exits and two nonzero exits. These are execution counts,
+not inference-quality claims: some tools are calculators, simulations, asset
+generators, or dependency probes. The GB10-only demo remains unsupported on B200.
+
+The two-B200 reruns exposed invalid collective keyword arguments in expert
+parallelism, unsafe unbatched ring transfers and fully masked softmax blocks,
+and an incompatible full-graph compile request around Transformer Engine's
+disabled compiler boundary. The DTensor tool also confused visible device IDs
+with process ranks. Repairs are committed in `99a365de6` with 57 focused CPU
+checks passing and three hardware checks skipped. Their B200 results follow
+below. The default dynamic-router tool now fails if requested vLLM execution
+cannot initialize; explicit synthetic mode records its provenance. Its earlier
+successful exit must not be reused as real vLLM evidence.
+
+The seven-caller TMA validator compiled and found a separate odd-width defect:
+the Chapter 7 copy kernel overwrote 387 row-padding values for a 129-by-385
+logical tensor with leading dimension 400. The follow-up preserves TMA stores
+for full tiles and bounds ordinary stores on partial tiles. Strict full-output
+and canary checks are unchanged; the subsequent B200 closure is recorded below.
+
+The standalone KV experiment compared the exact 256-step FP8 body with graph
+replay on the same buffers. Eight interleaved AB/BA rounds produced 80 samples
+per path, after five warmups per path:
+
+| Diagnostic | Eager FP8 body | CUDA graph replay |
+|---|---:|---:|
+| Median CUDA-event time | 36.7343 ms | 23.8563 ms |
+| 5th–95th percentile | 36.7258–36.7649 ms | 23.8482–23.8694 ms |
+| Profiled kernel executions | 8,192 | 8,192 |
+| In-range CUDA runtime calls | 16,385 | 3 |
+
+Raw FP8 bytes and FP32 scales matched bitwise before and after measurement;
+the full BF16-reference check also passed at its existing tolerance. Graph
+preparation cost 175.357 ms including three preruns, with 1,024 additional
+allocated bytes and 4 MiB additional reserved memory. This is approximately
+35.1% lower latency for the existing FP8 body, with matching kernel work in the
+Nsight trace. It is a noncanonical mechanism experiment, not an overall win
+against the BF16 baseline. The integrated candidate still needs its full paired
+benchmark and required profiler checks.
+
+The first two multi-GPU benchmark targets completed timing and Nsight Systems
+capture but retained `failed_profiler` outcomes. The pure-copy Chapter 2 target
+produced no NCU kernel report, and Chapter 4 gradient fusion lacked an explicit
+timed NVTX range for direct distributed NCU capture. These failures remain
+visible while the queue continues.
+
+Practical improvement priorities are consistent standalone launch metadata,
+real behavioral tests for distributed paths, explicit synthetic/unsupported
+result categories, and profiler requirements that reflect the workload being
+measured. The cost calculator now also ran with explicitly illustrative inputs;
+those values are not measured B200 power or token throughput.
+
+### Integrated lab reruns and remaining launch repairs
+
+The direct repair wave on `90bc4f720eaf2881213a2a151087aafe05861730`
+passed **64 focused GPU tests with no skips**. The expert-parallel, compiled
+decode, and DTensor entrypoints completed with two actual B200 workers. The
+context-parallel demo completed with `CUDA_LAUNCH_BLOCKING=1`, then passed a
+separate normal asynchronous two-rank rerun. All completed stages drained
+their owned processes.
+
+The integrated `labs/kv_optimization:kv_standard` pair passed its full default
+workload, correctness checks, and both required profilers with graph replay
+enabled. This closes the integrated graph candidate's execution gate on this
+virtualized host. The paired run used 16,566 MiB versus 32,948 MiB for BF16,
+a 49.72% memory reduction, while latency was 22.999 ms versus 17.334 ms.
+It passed the declared memory goal; the FP8 path remained slower than BF16.
+It does not turn the earlier FP8-versus-FP8 experiment into
+an overall performance win against BF16 or into canonical hardware evidence.
+
+The broader sweep had completed 13 multi-GPU target attempts before the repair
+wave; none had an overall passing result. Some timing and Nsight Systems
+captures completed, but required profiler stages failed. The gradient-fusion
+range repair allowed NCU to start, then kernel replay stalled for more than
+12 minutes. The owned stage was interrupted with its artifacts retained and
+an explicit failed result. Distributed collectives need concurrent execution;
+the follow-up selects application-range replay instead of serial kernel replay,
+consistent with NVIDIA's [profiling guide](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html).
+That follow-up still requires a fresh successful capture.
+
+The launch audit also found paired distributed modules whose torchrun specs
+executed their files without invoking the defined `main()` function. The repair
+uses an explicit named-function worker adapter, preserving paired modules as
+import-only. CLI tests must demonstrate that the requested worker entrypoint
+is invoked; a successful import is insufficient execution evidence.
+
+The seven-caller TMA wave passed cases 0, 5, and 6 under memcheck. Cases 1, 2,
+and 4 exposed the same 387 overwritten padding values on an odd-width tensor;
+case 3 required the relaxed-constexpr compiler flag already used by native
+builds. Commit `284c89346` bounds partial-tile stores in the remaining callers
+and adds that flag to the standalone validator. Full tiles retain their TMA
+path. Its real host helper regression checks all logical output, padding, and
+allocation guards. The subsequent B200 gate on `284c89346` passed all seven
+callers and all 42 full-output/canary cases, with Compute Sanitizer enabled.
+
+The same commit removes the NVFP4 tool's FP16 Transformer Engine fallback and
+unused graph capture. It requires an explicit single-rank TensorRT-LLM NVFP4
+engine with usable assets and actual generation output. Without that engine,
+the tool reports an unsupported prerequisite and exits nonzero. A positive
+engine-load/generation claim remains gated by a real engine asset. The combined
+local TMA, distributed-range, and NVFP4 selection passed 64 tests and skipped
+the real-engine-only test. The B200 TMA/NVFP4 selection passed 36 tests with
+that same asset-dependent skip. The real NVFP4 CLI returned nonzero with the
+explicit missing-engine diagnostic. These reruns drained all owned processes.
+
+The next broad pass prioritizes execution and correctness across the complete
+inventory with profiling explicitly disabled, while repaired profiler paths
+and optimization candidates receive separate captures. Those broad results are
+diagnostic execution evidence and cannot satisfy canonical profiling gates.
+
+### Distributed timing and output follow-up
+
+The execution-first sweep attempted the original 22 multi-GPU inventory entries
+and then reached the single-GPU examples. Four distributed targets exited zero
+and 18 returned nonzero. These counts do not qualify distributed performance:
+the audit found that the harness recorded whole-process wall time even when a
+worker emitted iteration latency, and gradient fusion compared an unrelated
+parent-side probe. Successful GEMM and batched-GEMM runs are retained separately.
+
+Commit `8490afa84` adds an explicit worker-timing contract. An opted-in worker
+must emit one finite positive rank-0 iteration mean and declare how many measured
+iterations it represents. Launch duration remains a separate metric; an
+aggregate mean does not acquire invented percentiles. Eleven focused timing
+tests passed, including real subprocess controls. Existing process-duration
+results remain labeled as such and must not be reused as iteration timings.
+
+Commit `9c19a76a6` replaces gradient fusion's repeated in-place FP16 SUM, which
+can overflow over 55 reductions, with a stable gradient-average primitive.
+The paired workload remains 2,048 tensors of 4 KiB, five warmups, and 50 measured
+iterations. Fresh per-rank results carry actual timed output and an independent
+FP32 average reference. Two-rank Gloo controls passed; the NCCL and application-
+range reruns remain separate B200 gates. Old SUM timings are incompatible with
+this corrected operation.
+
+The symmetric-memory pair now transports actual per-rank inputs and receive
+outputs and rejects missing or incorrect peer results. Rank-dependent inputs
+make a local-copy mistake distinguishable despite identical global seeds.
+Pipeline workers also select their own nested stage rather than stage zero,
+and the optimized virtual path traverses its nested layer lists correctly.
+The pipeline pair still has a separate parent-side verification path; passing
+that path does not certify distributed child tensors.
+
+The vLLM tool failed honestly because the prepared FlashAttention 4 environment
+exposes `flash_attn` without the older `flash_attn.ops` module expected by vLLM
+0.16. An existing isolated environment imports the same Torch 2.9.1+cu130 and
+vLLM without that namespace collision; its actual inference rerun is pending.
+No shared runtime was changed. The model fetcher now returns absolute paths and
+checks the presence of every indexed weight shard before treating a cached
+directory as complete. A config file alone is insufficient.
+
+The remaining launch audit identified five more import-only targets in Chapter
+17 and the cache-aware disaggregated lab, plus seven targets that need fresh
+child-output verification. Thirty distributed-training adapters already report
+their missing verification contract explicitly. GPU inventory routing is also
+being repaired because imported benchmark classes can require multiple devices
+without repeating those requirements in their thin wrapper files.
+
+### Direct B200 wave 6 and corrected sweep routing
+
+All seven wave-6 stages on `9c19a76a6` terminated with confirmed child-process
+drain. The focused tests and unprofiled gradient pair exited zero. The other
+five stages retained failures; they are not qualified passes.
+
+| Target | Observed result | Interpretation |
+| --- | --- | --- |
+| Gradient average, 2 B200 | 33.231804 ms baseline; 0.045565 ms fused | Actual full child outputs passed. One aggregate per arm; no repeated interleaved performance claim. |
+| Pipeline parallel | 15.577399 ms baseline; 23.287443 ms 1F1B | Candidate slower; performance contract failed. Parent virtual verification remains a separate limitation. |
+| Tensor parallel | 9.808 ms baseline; 9.973 ms asynchronous | No measured speedup; performance contract failed. |
+| Symmetric-memory performance | Child signature rejected | `float32` and `torch.float32` were compared without canonicalization; `cc72c9cac` repairs the comparison. Full peer-output checks remain mandatory. |
+| Gradient profiler bundle | Nsight Systems captured both arms; NCU and Torch failed | NCU application-range capture hit NCCL timeouts; Torch selected the in-process factory path. Neither failure is promoted to a capture pass. |
+| Router evaluation | vLLM workers rejected `stdout.fileno()` | `af1708d1b` uses descriptor-backed output capture. Actual model execution is being rerun in the existing isolated vLLM environment. |
+
+The dtype repair passed 49 focused CPU tests, including canonical and
+noncanonical dtype spellings, real dtype mismatches, and incorrect output from
+either rank. The vLLM capture repair passed 13 model/router tests, including
+native descriptor writes and a real subprocess diagnostic on the failure path.
+These CPU checks do not substitute for the subsequent GPU runs.
+
+Commit `4d3c568ab` follows benchmark factories and inherited class metadata
+statically, without importing workload modules. The inventory remains 486
+targets, now correctly classified as 423 single-GPU and 63 multi-GPU targets.
+The multi-GPU set contains 49 torchrun targets and 14 with in-process execution.
+Routing tests also preserve an explicitly declared four-GPU minimum. The
+execution-first sweep resumed on `af1708d1b` with those launch distinctions,
+profile mode `none`, and forced reruns of previously invalid distributed
+successes. Successful prior stages retain their original source identities.
+
+### Direct B200 wave 7 and real router inference
+
+All eight wave-7 stages on `40a4b9d17` drained their owned processes. The
+focused selection passed 106 tests. The symmetric-memory performance pair
+passed complete peer-output checks (73.244 ms baseline, 27.442 ms optimized).
+The four Chapter 17 pairs now invoke explicit worker entrypoints and validate
+their actual complete decode output against an independent prefill reference:
+
+| Pair | Baseline / optimized iteration mean | Result |
+| --- | --- | --- |
+| Batched | 1031.455 / 4.137 ms | Correctness and timing contract passed |
+| Prefill/decode overlap | 1119.273 / 283.281 ms | Correctness and timing contract passed |
+| Long-context TPOT | 3385.711 / 831.877 ms | Correctness and timing contract passed |
+| TTFT | 848.487 / 209.079 ms | Correctness and timing contract passed |
+
+These are single aggregate measurements per arm on a virtualized host. They
+are diagnostic results, not repeated interleaved or canonical speedup claims.
+
+Cache-aware distributed inference passed full child-output checks but failed
+its performance contract: 13.672 ms baseline versus 14.592 ms optimized. With
+one prefill and one decode rank, both policies select the same decode rank;
+this topology cannot demonstrate fewer migrations between decode ranks.
+The harness now preserves valid measured ratios below 1.0 rather than
+clamping a regression to 1.0.
+
+Both gradient arms passed Nsight Systems and actual Torch worker profiling.
+The optimized arm also passed Nsight Compute after restricting its capture
+range to rank zero while both ranks execute their collectives. The baseline
+NCU capture timed out; its partial report remains a failure. Commit
+`52560085c` profiles one representative iteration of the same workload while
+leaving the ordinary 50-iteration measurement unchanged. Its fresh B200
+capture and the repaired MoE hybrid pairs are the next focused batch.
+
+The isolated vLLM runtime completed real generation for all 16 router-evaluation
+prompts after the stdout-descriptor repair. Its result explicitly reports
+`vllm_quality_with_synthetic_telemetry` and mixed evidence: quality uses vLLM,
+while latency and routing telemetry are synthetic, and throughput is derived
+from that synthetic latency. Those printed latency/throughput values are not
+measured serving performance or valid cost-per-token inputs.
+
+The breadth sweep was stopped after an owned NVSHMEM pipeline stage stalled;
+its failure and confirmed process drain were retained. The pipeline transport
+and additional NVSHMEM child-result contracts are being repaired. The next
+breadth phase assigns disjoint single-GPU target lists to the two B200s so
+coverage can advance while the remaining distributed repairs are checked.
+
+### Direct B200 wave 8 and parallel single-GPU coverage
+
+Wave 8 on `52560085c` completed all four stages with confirmed process drain.
+Focused tests passed. Both MoE hybrid variants passed the baseline replay but
+rejected the optimized final route assignments. A separate real two-rank,
+six-step diagnostic started both paths with identical parameters and input.
+Initial routes matched; BF16 output differences of 0.002–0.004 and gradient
+differences up to 1.9e-6 became different BF16 AdamW parameter updates. Routes
+then diverged on later steps. The mixed-precision training repair remains open;
+the output and route checks have not been relaxed.
+
+The one-iteration gradient profiler retry still failed baseline NCU replay.
+Both Nsight Systems and Torch captures succeeded, and normal 50-iteration
+gradient correctness passed (33.012 ms baseline, 0.045810 ms fused). A failed
+profiler bundle remains failed even when ordinary execution succeeds.
+
+Commit `f99426593` preserves all four distributed work-contract fields when
+coercing serialized signatures; 34 CPU tests passed, including real Gloo
+execution. Commit `4c640451e` fixes foreign-process inspection to query the
+selected CUDA device's NVML identity. Its 42 CPU controls passed, and a live
+B200 check confirmed that logical device zero under `CUDA_VISIBLE_DEVICES=1`
+resolves to physical GPU 1.
+
+The full inventory on `4c640451e` contains 486 targets: 422 single-GPU and 64
+multi-GPU. At 13:36 UTC, two direct queues began disjoint sets of 211 single-GPU
+targets each. Both initial GEMM targets entered real isolated worker execution.
+These queues use profile mode `none`; their timings are diagnostic coverage
+results. No two-GPU workload overlaps this phase. The remaining distributed
+training manifest contains 61 explicit variant commands with source hashes;
+those direct runs and final-source full-suite validation are still pending.
+
+### Direct B200 wave 9 and first breadth results
+
+The two single-GPU queues stopped cleanly after 55 terminal targets: 45
+succeeded, seven skipped, and three failed. Their results and original source
+identity are retained. One skip requires Grace hardware. Six others exposed
+GPU-routing metadata problems. The failures were pinned-prefetch training
+correctness and two launch-bounds pairs whose measured ratios were only about
+1.003, below their existing performance contract.
+
+Wave 9 on `b587cdde9` completed all ten stages with confirmed process drain.
+Focused tests passed, including actual CUDA prefetch training across repeated
+setup/teardown cycles. The NVSHMEM training pair passed full child-output and
+reference checks on two B200s: 6.203 ms baseline and 0.913 ms optimized. This
+single aggregate remains diagnostic timing, not a qualified speedup claim.
+
+The pipeline, training-pattern, broadcast, and ring workers exposed global
+rank-specific RNG reseeding after real execution. Commit `d38dfdf15` replaces
+those input generators with local generators so rank-distinct data does not
+change the harness seed. Measured and reference sequences remain identical.
+The affected CPU selection passed 77 tests; fresh GPU checks are pending.
+
+Pinned-prefetch setup previously retained its batch cursor; that restart bug
+was fixed and its real CUDA regression passed. Full default execution still
+failed because adaptive timing can give the faster stateful training arm more
+optimizer updates. Commit `dcee02a05` fixes both arms to the configured update
+counts, preserving the ordinary 20 measured iterations and ten warmups.
+Focused CPU checks passed; the full B200 pair is being rerun.
+
+Both MoE hybrid variants still rejected optimized final route assignments.
+FP32 optimizer state, routing, and accumulation delayed divergence but did not
+resolve it. A fresh six-step, two-rank diagnostic on `b587cdde9` found identical
+initial routes and output differences of 0.00390625, followed by four and three
+route mismatches on the final step. Exact route and complete-output checks
+remain intact. This repair is still open.
+
+Commit `1a8958ac1` tests a 512-thread, three-block launch bound for the
+register-heavy kernels. Baseline geometry, input size, arithmetic, and repeat
+counts remain unchanged. It is an optimization hypothesis until real
+correctness, interleaved timing, and counter evidence establish the result.
+
+### Direct B200 wave 10 and resumed coverage
+
+Wave 10 on `1a8958ac1` completed all nine stages and drained their processes.
+All 40 focused tests passed on the real CUDA runtime, including architecture
+compilation checks. Ordinary benchmark runs used profile mode `none`.
+
+| Pair | Baseline / optimized mean (ms) | Actual result |
+| --- | --- | --- |
+| Pinned-prefetch MLP | 1.236 / 0.569 | Complete output and performance contract passed |
+| NVSHMEM broadcast | 0.04346 / 0.03318 | Two-rank complete output and performance contract passed |
+| NVSHMEM training patterns | 24.007 / 22.878 | Complete output passed; 1.04934 ratio missed the unchanged 1.05 threshold |
+| Symmetric-memory ring | 0.02337 / 0.09875 | Complete output passed; optimized transport was slower |
+| Launch bounds, Python extension | 17.817 / 17.578 | Complete output and performance contract passed |
+| Launch bounds, CUDA binary | 0.18485 / 0.18247 | Complete output and performance contract passed |
+
+Both NVSHMEM pipeline variants passed baseline execution and rejected the
+optimized full output. About half the output values differed from the serial
+reference, with maximum absolute difference 5.0625. The seed repair allowed
+the real transport correctness check to run; it did not establish pipeline
+correctness. The signal/handoff implementation remains under repair.
+
+A separate launch-bounds experiment on the same source used four ABBA blocks
+and five samples per slot, totaling 40 samples per arm. Every slot retained
+bitwise equality of all 1,048,576 output elements. Median time for 96 kernel
+launches was 17.8022 ms baseline versus 17.5111 ms optimized, a 1.01662 ratio.
+Sample standard deviations were 0.01295 and 0.00211 ms. Both Nsight Compute
+captures succeeded: the 1024-thread baseline used 36 registers per thread,
+while the 512-thread candidate used 39; measured active-warps occupancy rose
+from 48.93% to 68.37%. This supports the launch-geometry mechanism. The host
+is virtualized and the interleaved probe did not lock clocks; these remain
+diagnostic measurements, not a canonical performance claim.
+
+Commit `6cf523280` fixes target-level sweep continuation/resume and GPU
+classification. It retains successful verified targets individually, invalidates
+stale successes after a newer failed or missing-summary attempt, and preserves
+frozen target identities. The focused CPU selection passed 151 tests. The
+inventory is now 486 targets: 417 single-GPU and 69 multi-GPU. Five examples
+require two visible GPUs in one process; they do not require torchrun. The
+disaggregated/reinit examples explicitly retain their one-rank default.
+
+Commit `96027d064` extends the fixed-update correction to 13 other stateful
+training targets, changing 22 variant configurations while preserving their
+existing iteration/warmup counts. The configuration/lifecycle selection passed
+14 CPU tests with two actual-CUDA cases skipped. Full execution of those
+targets remains part of the sweep.
+
+At 14:17 UTC, two fresh direct queues resumed disjoint halves of the 417
+single-GPU targets on `96027d064`. They share the combined retained ledger,
+preserve its original source identities, and force repaired early training
+and one-rank metadata targets to rerun. Distributed work will run after this
+phase drains. Neither examples nor these queues require Slurm.
+
+### Direct B200 wave 11 and breadth checkpoint
+
+Wave 11 executed on source `433815990`. All nine supervised stages terminated
+with confirmed descendant drain, and the focused XML records 37 passed tests
+with no failures, errors, or skips. These runs used the portable validity
+profile and profile mode `none`; their timings are diagnostic observations.
+
+| Target | Observed result | Interpretation |
+| --- | --- | --- |
+| MoE six-step diagnostic | 12 rank-steps; zero route mismatches, output delta, gradient delta, and parameter delta | The corrected mixed-precision paths remained exact across both ranks and every step. |
+| MoE hybrid EP | Complete input and output verification passed; ratio 0.933636 | Correctness passed, but the unchanged 1.05 performance threshold failed. |
+| MoE hybrid EP multi-GPU | Complete input and output verification passed; ratio 1.023102 | Correctness passed, but the unchanged 1.05 performance threshold failed. |
+| TMA copy default target | Complete execution and verification passed | This is the current runtime result for the repaired 2D host oracle. |
+| Symmetric-memory ring demo | Seven changing-input, full-output checks passed on both ranks; the real default benchmark function also completed | This closes the observed send-before-receive deadlock for this direct two-rank path. |
+| Disaggregated communication | Complete input and output verification passed; ratio 0.933842 | Correctness passed, but the unchanged 1.05 performance threshold failed. |
+| Both NVSHMEM pipeline aliases | Each baseline passed; each optimized launch exceeded its timeout at about 302 seconds | Neither optimized pipeline run is a runtime pass. |
+
+The first and resumed breadth shards recorded 85 unique terminal targets: 77
+passed, six skipped, and two failed. Wave 11 separately reran the previously
+failed TMA target successfully; that retest updates its latest evidence but is
+not counted as an additional unique breadth target.
+
+Three subsequent source repairs await wave-12 execution. Commit `dfb5be2d3`
+eagerly initializes each NVSHMEM pipeline NCCL sideband in deterministic setup
+order before asymmetric point-to-point traffic. Commit `e72c0e3af` gives the
+communicator lifecycle examples a real one-rank store and direct execution path.
+Commit `086f53f07` uses reusable `addmm` outputs for the reduction MLP bias.
+Their source and focused CPU checks do not establish B200 runtime results.
+
+The prepared distributed-training manifest still contains 61 commands that
+have not run because required dependencies are missing. Manifest validation and
+supervisor controls are preparation evidence only. Wave-11 timings, breadth
+results, and later source repairs do not support public performance claims.
+
+### Direct B200 waves 12–13 and training retry
+
+Wave 12 executed on `e72c0e3af`. All eight supervised stages drained their
+descendants, and the focused XML records 23 passes with no failures, errors, or
+skips. The reinitialization pair passed complete verification at 430.622 ms
+baseline and 0.031231 ms optimized, a 13,788.29 ratio dominated by local
+one-rank process-group setup overhead. It is not distributed performance
+evidence. The CPU-reduction and NCCL-labeled reduction targets passed complete
+verification at ratios of 4.019 and 4.029. The one-rank disaggregated target
+also passed complete verification at 1.104.
+
+The `disaggregated_multigpu` stage exited zero only because it was launched with
+one visible GPU and reported `SKIPPED: Distributed benchmark requires multiple
+GPUs (found 1 GPU)`. It remains pending a proper two-GPU run. Both NVSHMEM
+pipeline aliases again passed their baselines and timed out in optimized
+execution; wave 12 did not validate the eager-NCCL-sideband repair.
+
+Wave 13 executed on `feee566fa`. All five stages drained, and the focused XML
+records 39 passes with no failures, errors, or skips. Commit `0561c5e76` moves
+pipeline ownership tokens to CPU/Gloo while retaining symmetric-memory payload
+movement and its completion fences. Both pipeline aliases then passed fresh,
+complete child-output verification: `nvshmem_pipeline_parallel` at 3.184846 and
+`nvshmem_pipeline_parallel_multigpu` at 3.090132. These are single diagnostic
+ratios from the portable, unprofiled run.
+
+Both MoE hybrid targets also passed their complete child-output checks on the
+`feee566fa` source. Their ratios, 0.958897 and 0.989798, remained below the
+unchanged 1.05 threshold, so both benchmark results correctly remain
+performance failures despite their correctness passes.
+
+The isolated training environment preserves Torch 2.9.1+cu130 and Transformers
+4.56.0, with Datasets 5.0.1 and Accelerate 1.14.0 added. The TinyLlama snapshot
+and GLUE/MRPC splits are materialized in its shared cache. Four actual Linux
+controls passed for the private-environment launcher, symlink, shared-cache, and
+owned-descendant supervision path. All 61 rows are prepared. The initial
+launcher failed before entering the workload because its remote manifest was
+missing; that failure is retained. The manifest has since been copied and all
+95 bound source hashes reverified, and a retry is in progress. The training
+sweep remains incomplete, and no workload execution result is claimed.
+
+Source through `feee566fa` is pushed. At this checkpoint, pull request 18 has
+two passing and two still-running CI checks. That transient CI state and all
+wave-12/wave-13 timings are operational evidence, not public or canonical
+performance claims.
+
+### First complete training pass and direct B200 wave 14
+
+The first 61-row distributed-training pass ran source `feee566fa` to terminal
+state for every row and confirmed all 61 descendants drained. Thirty-one rows
+passed and 30 failed. The failures formed three concrete groups: six could not
+load the required `flash_attn` distribution, 22 pipeline rows attempted an
+in-place ReLU on an autograd leaf, and two ZeRO-3 rows modified a backward-hook
+view in place. These retained failures are execution evidence; the pass did not
+qualify the affected workloads or produce a performance result for them.
+
+Three subsequent source revisions address those groups without relabeling the
+failed pass. Commit `db3f03d17` applies padding-aware labels and loss masking to
+19 training rows; its focused CPU selection passed 14 tests. Commit `eb7e52763`
+preserves autograd leaves at pipeline activation boundaries; six CPU tests ran
+the actual schedules successfully. Commit `582ec8c86` protects ZeRO-3
+backward-hook views from the in-place activation, with 13 focused Gloo CPU
+checks passing. Those CPU checks establish the repaired control and math paths,
+not B200 completion.
+
+The separate FlashAttention-2 environment uses the official
+`flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE` wheel. Its downloaded SHA-256 is
+`a4b43bd016f5d475dc34a87aa91b5a239bd0e8972c13f4fc32839b4032465d21`,
+the extension contains an `sm_100` cubin, and the actual import retained Torch
+2.9.1+cu130 with CXX11 ABI enabled. A fail-closed B200 probe then passed both
+fixed-length `flash_attn_func` and padded, odd-length
+`flash_attn_varlen_func` cases. Every output and Q/K/V gradient element was
+checked against a forced-math FP32 SDPA reference; the probe exited zero in
+2.038 seconds and its supervised process drained. This validates the tested
+FA2 APIs and runtime tuple. It does not replace fresh results from the six
+training rows that previously failed to import FA2.
+
+The repaired 61-row pass completed on `582ec8c86` inside that isolated FA2
+environment: **61 zero exits, zero failures, and all 61 supervised process
+trees drained**. The inventory comprises 27 one-rank and 34 two-rank runs.
+Every receipt binds manifest SHA-256
+`198d92ad61031047c05e026ac0cc012122493ac62257ce32b7d45aa645469066`,
+which retains the original 61 commands, workloads and rank topologies and
+binds 95 source files. This rerun closes the observed import and autograd
+execution failures, including the six FlashAttention rows, 22 pipeline rows
+and two ZeRO-3 rows that failed in the first pass. These remain diagnostic
+training executions: the generic wrappers still lack a qualified child-result
+protocol. Requested step counts are not asserted as completed step counts;
+for example, a DDP loader exhausted after 57 steps and reported that actual
+count.
+
+The training phase finished at 16:23 UTC, and both B200s immediately started
+the resumed 417-target single-GPU inventory in independent shards. The 69
+multi-GPU targets, remaining stages and final tests follow afterward. Those
+stages remain incomplete. Pull request 18 remains open, with its latest CI
+still pending. Full training receipts, commands and logs are retained locally
+under the dated `training-all-repaired` artifact bundle alongside the original
+failed pass.
+
+Wave 14 ran five supervised stages on the intermediate `eb7e52763` source and
+drained all five. The focused XML records ten passes with no failures, errors,
+or skips. The ring generation probe checked three message sizes for 45 changing
+generations each, or 135 full bitwise comparisons per rank, and passed on both
+ranks. The canonical ring benchmark invocation still failed its unchanged
+speed contract at a 0.269935 ratio despite complete verification. The
+disaggregated benchmark with two visible GPUs in one process also passed
+complete verification but failed the speed contract at 0.836775. Its forced
+two-rank invocation failed because the worker did not return the required child
+verification payload; an explicit child-result contract is under repair. None
+of these three failed benchmark results supports a performance claim.
+
+Commit `569e7cf5a` repairs the two-rank disaggregated worker contract: normal
+discovery now requests two torchrun ranks, timing comes from worker CUDA
+events, and both complete prefill/decode outputs are checked for every rank.
+Six focused CPU tests passed, including real two-rank Gloo execution. The
+workload still runs both phases and both reductions on each WORLD rank; it
+does not claim dedicated prefill/decode GPU groups. A fresh two-B200 run of
+this revision remains pending while the broader sweep runs on frozen
+`582ec8c86`.
+
+### Direct B200 wave 15 and measured cost-tool inputs
+
+The next breadth segment added 24 successful single-GPU executions on
+`582ec8c86`, through the Chapter 10 distributed shared-memory examples. Both
+shards stopped after complete stages and their supervisors confirmed drainage.
+The parent coordinator then hit an event-field logging collision; its aborted
+state is preserved. A focused control now exercises the real event writer with
+two stopped child queues and verifies the repaired, distinct lifecycle and
+child-terminal fields. No benchmark result was lost or relabeled.
+
+Wave 15 ran 12 stages on `41a609f12` and drained every process tree. All 22
+focused tests passed. The repaired two-rank disaggregated target passed full
+prefill/decode output verification with 0.198413 ms baseline timing and an
+observed 1.106246 ratio. The unchanged default NVSHMEM pipeline also passed
+full verification at a 3.184358 ratio after the shared helper gained explicit
+CUDA-backend selection.
+
+The CUDA ring passed 135 changing, full bitwise generations per rank on
+nondefault streams. Its device barrier waited 500.836 ms for an intentionally
+delayed peer, distinguishing it from the NVSHMEM no-op. Four ABBA blocks with
+40 samples per arm retained max-rank medians of 0.020847 ms for NCCL and
+0.026115 ms for CUDA symmetric memory, a 0.798267 ratio. Both ordinary ring
+aliases also passed complete correctness but missed the unchanged speed gate
+at 0.833322 and 0.813429. Nsight Systems shows exactly 800 device barrier
+kernels and 800 asynchronous copies per rank in each 400-iteration optimized
+range, with no NCCL kernel there. The roughly 12.2 ms profiled range contains
+4.0–4.4 ms of barrier kernel time, motivating a CUDA graph dispatch experiment.
+These unlocked, virtualized-host measurements remain diagnostic.
+
+The four FP16/INT8 compression targets that had previously skipped under
+one-GPU routing were run with two ranks. All four exposed missing child
+verification payloads; their apparent 6.5-second baseline timings were process
+startup, not worker iteration measurements. Their worker/result transport is
+under repair. The separate `ch04:no_overlap` pair had the same class of defect;
+commit `3526a0b13` adds full training outputs, an independent functional SGD
+reference and worker timing. Five focused tests passed, including actual
+two-rank Gloo; its B200 rerun remains pending.
+
+The cost calculator now has an actual successful invocation on source
+`41a609f12`. A separate two-B200 vLLM run completed all 16 prompts and returned
+768 token IDs over a 0.541600-second generation interval. NVML samples bracket
+that same interval; their integrated board-power estimate is 534.244 W and
+289.347 J. The calculator consumed those measured inputs and exited zero, and
+all descendants drained. Its $0.16/kWh electricity and 1.5 PUE values are the
+tool's explicitly labeled example assumptions. This short integration check
+does not establish serving throughput or production cost. Artifacts are
+retained in the dated `wave15`, `cost-tool`, and `continuation-through-ch10`
+bundles.
+
+### Direct B200 waves 16–17 and gradient-compression workers
+
+Wave 16 completed seven stages on `8c867e77f`, with all descendants drained
+and 20 focused tests passing. The no-overlap pair now passes complete training
+output and input verification on two B200s. Its observed ratio was 0.944683,
+so the execution defect is closed while the unchanged speed gate remains open.
+Both ring aliases also passed correctness but missed their speed gates at
+0.848128 and 0.874363. The graph ring passed 135 changing bitwise generations
+per rank; four ABBA blocks with 40 samples per arm yielded a max-rank ratio
+of 0.846141. Nsight confirms one graph launch, 800 barrier kernels, 400 local
+copies and 400 peer copies per rank in each complete 400-iteration range.
+
+Commit `a3d4519a1` removes the ring's redundant local receive copy: the peer
+already writes the symmetric receive slot, which is consumed directly after
+the same publication and consumption barriers. Wave 17 completed all six
+stages and drained every process tree. All 15 focused tests passed, as did
+135 changing bitwise generations per rank and a 500.905 ms delayed-peer
+barrier control. Nsight independently confirms exactly 400 peer transfers
+of 2 MiB and 800 barriers per rank, no local copies or NCCL kernels in the
+timed optimized range, and one graph launch. Four ABBA blocks retained
+40 samples per arm, with max-rank medians of 0.020765 ms for NCCL and
+0.024362 ms for the candidate (0.852351 ratio). The ordinary aliases passed
+complete verification but missed the speed gate at 0.870437 and 0.873836.
+Removing physical copy work has not established a latency win on this host.
+Both waves remain diagnostic measurements from the virtualized, unlocked host.
+
+Commit `03451f9c3` gives all four gradient-compression pairs explicit two-rank
+workers, actual worker timing and complete input/output verification. Each
+rank retains the original 1 GiB gradient, five warmups and ten iterations.
+The full FP16/INT8 variants reduce rewritten compression buffers in place;
+baseline buckets require no added assembly copy. Communication-only variants
+preserve their constant inputs with the same functional out-of-place collective
+in both arms. That process-model allocation differs from the former
+same-process preallocated output API, so absolute latency is not continuous
+with those older measurements. Eight focused CPU tests passed, including
+real two-rank Gloo execution of all eight variants.
+
+The next two-B200 run passed full FP16, FP16 communication-only and INT8
+communication-only checks, with observed ratios of 1.895051, 1.881169 and
+3.314383 respectively. These are diagnostic harness measurements, not repeated
+performance qualification. Full INT8 exposed a parent independent-reference
+failure: three values in the first 16,777,216 elements differed across the
+CPU/CUDA quantizers by one code per rank near a rounding boundary. The child
+reference and timed outputs agree at those positions; the complete inputs,
+outputs and child reference are retained. The parent reference is being
+corrected to use the execution backend without changing tolerances.
+The remaining breadth sweep has resumed on frozen `03451f9c3`.
+Its Linux continuation controls passed all four tests, including real normal
+descendant drainage and timeout cleanup. Training's 61 successful rows retain
+their original `582ec8c86` source identity rather than being relabeled.
+
+That breadth segment added 49 executions through the start of Chapter 13:
+46 passed and three Chapter 10 targets failed. The epilogue and pipelined
+TCGEN05 logs prove a concurrent cache deletion race: Ninja lost its build
+directory and PyTorch's build lock disappeared. Commit `700ed2a46` adds a
+per-extension advisory lock outside the deletable directory, covering cache
+invalidation, compilation and metadata publication. The same repair keeps
+setup buffers private until actual computation produces the epilogue and
+cuBLAS comparison outputs. The expanded CPU lane passed 557 tests with one
+skip after two stale source-inspection assertions were aligned with the
+cached training helper and private output buffers (`00019bed7`).
+
+Both sweep shards stopped after complete stages and drained all descendants.
+The new coordinator then exposed another event-field collision while recording
+their terminal states. Its aborted result remains intact; a separate recovery
+ledger retains the original base and both complete shard ledgers, including
+the three failures. This is ledger recovery, not coordinator success. The
+coordinator event path is receiving an actual stopped/failed-queue regression.
+
+The corrected coordinator passed five Linux controls, including actual
+`wait_queue` completion for both a successful queue and a stopped queue with
+retained failures. Wave 19 on `00019bed7` has now passed the complete saved
+INT8 input oracle on CUDA and fresh full INT8 runs: 1.852722 observed ratio
+for the full pair and 3.322505 for communication-only. All three Chapter 10
+targets also passed their normal B200 execution and verification reruns.
+The separate concurrent build check passed on `cfcb13bc0`: two processes
+rebuilt in an empty private cache, loaded the identical extension hash and
+produced exact complete CUDA matmul outputs on the two B200s. The overlapping
+load calls completed in 39.13 seconds.
+
+Two further performance candidates preserve workload math: `e77dc2f91` avoids
+DDP input routing for tensors already placed on the rank-local device, and
+`c4ce8d566` reuses MoE destination counts for both routing metrics and dispatch,
+removing a redundant device-to-host readback. Their CPU controls pass; actual
+B200 correctness passes for both candidates. The normal DDP run retained a
+0.984355 ratio; the MoE aliases retained 0.957508 and 1.196584. These mixed
+single-observation outcomes are not a performance conclusion. DDP subsequently
+passed all 16 full-output ABBA observations on `00019bed7`, with eight samples
+per arm and a 0.990286 ratio between rank-maximum medians. It remains a measured
+performance miss. Its baseline Nsight trace contains the expected 30 workload
+ranges (five warmups plus ten measured steps on each rank); the private
+validator incorrectly searched for the uncanonicalized range name. The failed
+receipt is retained, and a profile-only retry uses the actual canonical labels.
+Repeated MoE timing and both fresh DDP profiles remain queued behind the full
+GPU test suite.
+
+The full suite completed all 5,634 tests on `cfcb13bc0`: 5,552 passed,
+78 skipped and four failed in 33 minutes 18 seconds. Every descendant drained,
+and the complete logs and JUnit report are retained. Hosted CPU CI completed
+with 5,129 passed, 503 skipped and two
+stale assertion failures. One still expected the four gradient-compression
+targets to run in a single process; the other expected the TMA neighbor
+transform to equal its untransformed input. The updated assertions check the
+exact per-target launch modes and the full tiled-neighbor reference. Their
+owning tests and compiled host-oracle controls pass locally (21 tests).
+
+The GPU-only CPU-control failure exposed a harness bug: CUDA memory accounting
+was selected whenever CUDA was available, even for a benchmark on the CPU.
+Memory tracking now checks the benchmark device. The fourth GPU-suite failure
+came from standalone signature capture on an NVSHMEM wrapper that requires
+a distributed worker's complete result callback. That tool now explicitly
+reports the required `aisp bench run` path instead of attempting parent-side
+signature capture. The focused CPU lane passed 46 tests; two additional controls
+cover the distributed-signature boundary and all 1,064,960 gradient elements.
+Fresh B200 reruns of these repairs remain required.
+
+The training-patterns candidate batches the 512 gradient-pack and 512 unpack
+operations with two foreach calls. It preserves every value, collective,
+synchronization fence and optimizer update. CPU controls cover disjoint bucket
+views, inactive gradients and replacement gradient objects across steps.
+Its previous 1.049336 ratio narrowly missed the 1.05 gate; the candidate still
+requires full two-rank verification and repeated timing before any speed claim.
+
+Profiler policy explicitly permits interrupting or terminating owned NCU/NSYS
+processes without asking, for direct runs and scheduler jobs. Interrupted
+captures retain their artifacts and incomplete status.
+
+Wave 21 completed MoE's 16 full-result timing observations and captured both
+arms. Its optimized capture and the DDP baseline capture exposed an Nsys
+validator bug: the second statistics query reopened the original report and
+could reject the just-exported database as older than that report. Reading the
+fresh database directly succeeds on both retained captures and finds the
+expected workload ranges. The harness now uses that path; 38 profiler-contract
+tests pass with one skip. Original failed receipts remain intact, and the
+remaining DDP optimized capture is still required.
+
+Wave 22 on `48ab6ff1a` passed all 87 focused B200 tests, including the four
+previous full-suite failures. Both training-patterns targets passed complete
+two-rank verification, with initial ratios of 1.512702 and 1.413125. Every
+stage drained. Wave 23 then passed all 16 interleaved timing observations and
+both Nsys captures. The rank-maximum median fell from 23.785251 to 15.793236 ms
+per step (1.506040 ratio); the four block ratios were 1.506725, 1.369103,
+1.526312 and 1.508860. The slower optimized observation remains in the data.
+
+The actual 100-step Nsys ranges contain 257,000 baseline kernel launches per
+rank and 157,000 optimized launches. The optimized path uses 1,600 batched-copy
+kernels for the complete gradient packing/unpacking workload, with 200 NCCL
+barrier kernels; the baseline performs 51,200 NCCL per-parameter reductions.
+These are unlocked diagnostic measurements on the same two-B200 host, with
+full-output checks across every timing and profiler invocation.
+
+The corrected validator also passed all three retained Wave 21 reports.
+Fresh baseline and optimized DDP captures on `48ab6ff1a` passed full worker
+verification and workload-range checks. Their profiled timings are separate
+from the previously retained ABBA measurements; no DDP speed win is claimed.
+The breadth continuation then resumed automatically from the original ledger
+plus the actual Wave 22 outcomes.
+
+The next breadth segment reached Chapter 15 and exposed further failures.
+In the memory-profiling pair, stale expectation metadata labeled the study as
+a speed goal despite the executable declaring a memory goal. The harness now
+gives the executable's declaration priority. The baseline also accumulated
+gradients while the optimized variant cleared them; both now clear gradients
+before the same backward pass. Full gradient comparisons pass across repeated
+CPU iterations. Previous memory savings do not establish a fair checkpointing
+benefit under the corrected gradient lifecycle.
+
+The pooled KV-cache candidate fuses its QKV matrix multiply and bias addition
+into `addmm`, reusing the same output buffer and preserving the bias-free path.
+Complete projection-output and storage-reuse controls pass. These Chapter 13
+repairs passed 28 focused CPU tests and the 553-test hygiene lane (one skip);
+their actual B200 reruns are pending while the existing sweep continues.
+
+The cache-aware disaggregation performance miss also has a precise topology
+limit: one prefill rank plus one decode rank produces identical baseline and
+optimized locality routes. At least two decode ranks are necessary to test
+the locality benefit. The smallest useful explicit layout is three GPUs
+configured as one prefill plus two decode ranks; the first useful default
+layout is four GPUs (two plus two). Existing route tests and documentation
+already encode the one-decode-rank control. The two-B200 run remains valid
+correctness evidence, and its measured speed failure is preserved.
+
+The current instance exposes neither an InfiniBand device nor `nvshmemrun`.
+The IBGDA examples therefore retain their explicit runtime/hardware gate;
+Grace/GB10-specific examples still require the named hardware, and NVFP4
+TensorRT-LLM execution still requires a compatible engine asset.
+
+### Chapter 13/16 follow-up and main merge
+
+PR #18 merged as `dcd2c55d594dcacf6974b1a179c1eec69bf24153` after all
+four exact-head CI checks passed. Its tree matches the tested `48ab6ff1a`
+tree. The CPU suite passed 5,136 tests with 503 skips; the core contract lane
+passed 751 tests with one skip. Dual-architecture validation also passed.
+Runtime receipts retain their actual source commits.
+
+The continued B200 sweep exposed additional correctness defects. Both
+Chapter 13 regional-compilation arms retained the first warmup output and
+truncated verification to 128 tokens. They now capture the latest input and
+complete output and use a fixed iteration count so their rotating sequence
+buckets match. The Transformer Engine FP16/FP8 pair now explicitly declares
+precision-signature equivalence while retaining its actual precision flags
+and numerical tolerances. Obsolete accessors that returned the input as an
+output have been removed; the actual payload remains the model output.
+
+Both dense Flash Attention variants now view their preallocated merge buffer
+as `[batch, sequence, heads, head_dim]` when copying the transposed attention
+heads. Previously that four-dimensional tensor was copied into a
+three-dimensional buffer and failed at runtime. Full CPU attention-output
+comparisons and storage-reuse checks cover both variants. The focused and
+hygiene run passed 561 tests with one skip. GPU reruns of these new repairs
+are pending; the original failures remain preserved.
+
+The Chapter 14 regional Triton example also produced a native crash during
+isolated-process cleanup. Its complete stderr is retained. Cold-cache
+vanilla and repository-path reproductions are required before attributing
+that failure to the toolchain or changing a compiler mode.
+
+### Wave 24: Chapter 13/16 B200 reruns
+
+All nine stages on `5a59db088` drained their owned processes. The focused GPU
+lane passed 60 tests. Regional compilation now verifies the complete latest
+output, with maximum difference `0.03125`, and its diagnostic speed ratio was
+`1.0931`. Dense Flash Attention passes full verification with maximum
+difference `0.00048828125`; its diagnostic ratio was `12.9137`.
+
+The corrected memory-goal study passes execution and correctness, but does
+**not** show a memory benefit: baseline peak was `287.2974 MiB`, candidate
+peak `288.2974 MiB`, and the candidate was slower. The pooled KV-cache and
+Transformer Engine examples now pass correctness while retaining speed
+failures (`0.9478` and `0.6819` respectively). Passing a correctness gate does
+not turn these observations into optimization wins.
+
+Chapter 14 regional Triton passed a fresh cold-cache harness run. Separate
+cold-cache vanilla main-thread and worker-thread probes used the unchanged
+model definitions without importing repository modules. Both compared all
+outputs for 18 invocations and exited cleanly, with maximum difference
+`0.03125`. The original native crash remains an unreproduced failure; no
+compiler downgrade or toolchain attribution was added.
+
+Two further candidates are ready for measurement. The pooled KV cache now
+prepares token and prefix views when allocating the pool, avoiding repeated
+view construction in the decoding loop. RoPE writes its rotations directly
+into each cache slot, removing the scratch copy and final cache copy without
+batching future decoding steps. Both RoPE arms now verify every written
+cache slot and all step inputs. Full-prefix/cache CPU controls, including
+reused requests and untouched cache tails, pass; the focused/hygiene lane
+passed 561 tests with one skip. These candidates still require B200 timing
+and profiler evidence.
+
+### Waves 25/26: cache measurements and full-output controls
+
+All six Wave 25 stages on `0058fc6e6` drained. Ten focused GPU tests passed;
+the pooled KV and RoPE examples passed their normal speed gates at `1.0739`
+and `1.1539`. Two more Chapter 14 warm-cache harness runs passed. Its earlier
+native crash remains unreproduced, with no compiler workaround introduced.
+The dense Blackwell variant's CLI entry was explicitly informational and
+executed no benchmark; Wave 26 exercised its real factory and tensor path.
+
+Wave 26 retained eight observations per arm in four ABBA blocks for each
+target, with five warmups. Each pooled-cache observation ran the complete
+request workload; RoPE and dense-attention observations each contained 50
+complete invocations. All observations are retained. CUDA-event medians were:
+
+| Comparison | Baseline | Optimized | Ratio | Four block ratios |
+| --- | ---: | ---: | ---: | --- |
+| Pooled KV cache | 495.5062 ms | 451.4488 ms | 1.09759 | 1.09878, 1.09752, 1.09507, 1.09775 |
+| RoPE direct cache writes | 1.967337 ms | 1.705141 ms | 1.15377 | 1.15341, 1.15383, 1.15379, 1.15373 |
+| Dense Flash Attention variant | 7.661654 ms | 0.575625 ms | 13.31015 | 13.32500, 13.30270, 13.33621, 13.29302 |
+
+Verification ran before timing, after timing, and after profiling. The KV
+control captured every actual layer output across every token and request:
+5,505,024 values matched bitwise. All 2,097,152 written RoPE cache values also
+matched bitwise. Dense attention compared all 16,777,216 output values, with
+maximum difference `0.00048828125` under the unchanged tolerance.
+
+CPU operator profiles corroborate the mechanisms. Per full KV invocation,
+concatenations fell from 21,504 to zero and `as_strided` calls from 225,792
+to 161,280, while both arms executed 10,752 Flash Attention operations.
+RoPE retained all 64 matrix multiplications and removed the baseline's 64
+cache copies. The dense variant used one Flash Attention operation in place
+of explicit attention. These profiles establish operator counts, not kernel
+timings. The runs used unlocked clocks on a virtualized host and remain
+diagnostic evidence rather than canonical performance results.
+
+The remaining breadth sweep resumed automatically on the same immutable
+revision. The subsequent decode-compile failure was a speed miss (`0.9451`),
+with output verification passing.
+
+### Current follow-up repairs
+
+The monolithic inference stderr identifies why its compiled path was barely
+faster: Inductor skipped CUDA graphs because the function mutated an input
+buffer. The compiled request now creates its output internally through the
+same full prefill and autoregressive decode implementation. A real CPU graph
+capture control checks every output and unchanged prompts; B200 capture and
+speed verification are still pending.
+
+Memory summaries also clamped negative savings to zero. Aggregation now
+retains the best measured candidate's actual signed savings, excluding
+unverified candidates and nonfinite values. Reprocessing the retained
+memory-study result exposes its approximately `-0.3481%` savings instead of
+zero. The original result is preserved, and acceptance policies are unchanged.
+The focused and hygiene controls for these follow-ups passed 560 tests with
+one skip.
+
+The single-rank hybrid expert-parallel run exposed a signature error: it
+declared a distributed collective algorithm despite `world_size=1`. Its
+signature now describes local work without a collective; multi-rank runs
+retain their all-to-all contract. Thirteen focused CPU controls passed with
+one skip. Fresh one- and two-B200 execution remains pending.
+
+CI is deferred to the end of the remaining runtime and repair work, per the
+user's updated direction. Code changes continue to be committed and pushed;
+final checks and merges remain outstanding.
+
+- Run the complete GPU test suite on the final merged revision.
+- Complete all four sweep stages and reconcile the 486-target inventory,
+  including unsupported and failed cases rather than silently dropping them.
+- Finish missing protection checks and remaining attention/MoE investigations.
+- Validate four-GPU, multi-node and unavailable dependency combinations on
+  appropriate hardware. Two B200s do not establish those results.
+- Use repeated interleaved measurements and profiler evidence before accepting
+  a performance claim; virtualized-host measurements remain noncanonical.
+
+Reproducible entrypoints are documented in [the sweep playbook](../../code/FULL_SWEEP.md).
+Focused KV checks run with `python -m pytest tests/test_kv_optimization_append_paths.py`
+from `code/`. Hardware and dependency requirements still apply independently of
+whether an external scheduler is used.
+
+### Completed breadth and Wave 27 repairs
+
+The direct sweep on `0058fc6e6` finished with an outcome for every one of the
+486 benchmark identities. The final ledger contains 441 zero exits, 44 exits
+with code 1, and one native crash with code 139. Zero exits include explicit
+unsupported and informational cases; they are not 441 demonstrated runtime
+passes. The coordinator's larger failure count includes repeated attempts.
+The final GPU suite completed with **5,569 passed, 78 skipped, and two failed**
+out of 5,649 tests. All owned process groups drained and the results were
+preserved before advancing source.
+
+The two test failures identified a pooled-cache view restriction and README
+generation that depended on ignored local artifacts. Cached token views now
+use independent indexing instead of multi-output `unbind` views, preserving
+writable buffers in ordinary grad-enabled module calls. Ten focused CPU tests
+passed. Generator-owned READMEs now use checked-in historical rows; explicitly
+requested artifact rendering remains separate. Twelve generator tests passed,
+including a real temporary checkout with malformed ignored history.
+
+Additional repairs from the completed sweep are awaiting B200 reruns:
+
+- Sequence parallelism now identifies the `all_reduce` required by both arms
+  in its input contract. The baseline's redundant `all_gather` remains timed.
+  A real CPU path checks exact outputs and complete signature equality.
+- Two training metric examples now prepare reusable scratch storage in setup
+  and publish outputs only from `benchmark_fn`. The extension runs during
+  benchmark warmup; setup no longer publishes a precomputed reduction.
+- The MoE compiled path requests contiguous layout during the existing
+  one-hot mask dtype conversion. This repairs AOT functionalization of an
+  `out=` operation into a flat workspace, without changing expert routing,
+  workload dimensions, or the compilation mode. The failure reproduced with
+  both default Inductor and `aot_eager`; focused compiled/eager controls pass.
+- The independent NVFP4 grouped-GEMM reference now reuses its per-device E2M1
+  decode table. Recreating that constant from host data inside CUDA graph
+  capture caused five grouped targets to fail. All FP64 reference math and
+  full-output checks remain intact; a changing-input GPU graph regression
+  is included for the next run.
+
+Wave 27 on `66e284968` completed eleven owned stages. Monolithic inference
+passed full-output comparison (`max_diff=0.000244140625`) and measured
+`2.172626x` in one harness run. Repeated measurements and profiler validation
+remain pending, so this is a noncanonical observation. The memory report now
+correctly exposes `-0.348071%` savings for a candidate that uses more memory.
+The hybrid expert-parallel pair passed two-rank child verification but was
+slower (`0.958572x`). Its single-rank path progressed beyond the signature
+error and failed output comparison (`max_diff=0.765625`); investigation continues.
+
+Six full-workload KV calibration runs collected actual cache errors for
+seeds 42, 43, and 44, using batch 8, hidden size 16,384, prefill length 4,096,
+and 128 decode steps. FP8 relative L2 error was approximately `0.0410`;
+NVFP4 was approximately `0.1461`. These receipts are explicitly
+`measurement_only_not_accepted`, with no acceptance thresholds. Measured
+errors alone do not establish an independently accepted accuracy policy.
+
+Evidence is retained in the complete sweep's `ledgers/through-breadth.jsonl`,
+`failure-triage.json`, and `final-gpu-tests/full-gpu.xml`, plus Wave 27's
+per-stage termination receipts, benchmark results, and calibration JSON.
+CI and final merges remain deferred while code repair continues.
+
+### Wave 28: repaired examples execute on B200
+
+On `9aef30880`, the actual two-rank sequence-parallel pair passed its complete
+output contract (`1.583753x` observed). Both training metric pairs passed
+full-output comparison with unchanged tolerances. All five NVFP4 grouped
+cases completed graph capture and full comparison against the independent
+FP64 reference. The MoE compiled and aggregate targets passed with maximum
+output difference `0.00390625`. These are targeted current-host observations,
+not repeated, canonical performance claims.
+
+The MoE journey's existing verification payload retains only a `[4, 1, 8]`
+logit slice. Its successful comparisons above establish that the compilation
+error is repaired and the retained slice matches; they do not establish
+full-logit correctness. Expanding that payload to every timed token and logit
+is a separate pending repair and rerun.
+
+Focused GPU tests reported **114 passed, three skipped, and one failed**.
+The failure was in the newly added graph regression's fixture: 256 packed
+bytes were incorrectly reshaped into 128 slots. The fixture now retains all
+256 bytes and checks all 512 decoded values, with an additional complete
+CPU decode check. Its GPU rerun remains pending.
+
+One isolated Triton MoE attempt passed; a subsequent attempt again exited
+139 immediately after optimized timing. The labels requested cold/warm
+environment caches, but the harness creates its own per-process Triton
+cache. Those labels therefore do not prove a cache-dependent cause. Native
+crash attribution and model-only controls remain open.
+
+The broad monolithic profiler stage was interrupted through its owned
+supervisor after the baseline NCU kernel replay consumed several minutes.
+The action, process identity, reason, and artifacts were retained; all child
+processes drained. This capture remains incomplete. A bounded full-request
+Nsight Systems capture and an explicitly sampled NCU diagnostic are next.
+
+Two further source repairs are ready for target validation:
+
+- Single-GPU hybrid EP now uses the same fresh, fixed-step child-result path
+  as multi-GPU execution. Adaptive in-process timing had applied different
+  numbers of optimizer updates to the two arms. The ordinary `--single-gpu`
+  configuration resolves to one torchrun worker; no scheduler is required.
+  CPU tests cover the actual configuration merge and full child receipts
+  for one and two ranks.
+- The simplified Llama stack now explicitly uses RMSNorm epsilon `1e-5`.
+  The previous unset value selected BF16 machine epsilon (`0.0078125`).
+  This repairs model semantics but has not yet resolved the retained
+  full-stack output mismatch. A full 32-layer, 2,048-token comparison of
+  materialized attention, eager SDPA, and compiled SDPA will localize it.
+
+### Wave 29: fixed-step validation and numerical localization
+
+All 37 stages on `b601e9883` drained. The 31 focused GPU tests passed without
+skips, including the corrected complete FP4 graph regression. The one-worker
+hybrid EP path passed full child-result verification and measured `1.109086x`;
+the two-worker path again passed correctness but missed the speed threshold
+(`0.976906x`). Fixed-step execution closes the observed single-worker state
+mismatch without relaxing output tolerances.
+
+Monolithic inference retained eight observations per arm in four ABBA blocks,
+with 20 complete requests per observation. Median CUDA-event times were
+`10.224390 ms` and `4.253014 ms`, a `2.404034x` ratio; block ratios ranged
+from `2.398363x` to `2.411166x`. Every one of 65,536 output values passed
+before/after timing and after two prompt changes (`max_diff=0.000244140625`).
+Complete-request Nsight Systems captures show 10,330 ordinary kernel launches
+across ten baseline requests, versus ten graph launches and ten ordinary
+launches for the candidate. Both profiler outputs passed full comparison.
+The companion NCU captures deliberately sample eight launches per arm; they
+are not whole-request counter totals. These measurements remain diagnostic
+and noncanonical on this virtualized host, with unlocked clocks in the ABBA
+probe.
+
+The full 32-layer, 2,048-token Llama probe retained all eager layer outputs
+and every final output. Eager materialized attention versus eager SDPA first
+exceeded the unchanged tolerance at layer six; by layer 32 there were
+121,227 violating elements out of 8,388,608. Eager versus compiled SDPA had
+354,852 violations (`max_diff=0.28125`). The explicit RMSNorm epsilon repair
+does not close these differences; attention and compiled arithmetic require
+further numerical investigation.
+
+All six model-only MoE lifecycle controls completed using the full default
+model dimensions, two runs each in main-thread, joined-worker, and unjoined-
+worker modes. Those controls reproduced the old small verification-slice
+lifecycle; they do not prove complete-logit correctness. The actual harness
+under GDB still stopped at a native segmentation fault. Its backtraces and
+effective cache paths are retained; neither cache warmth nor worker joining
+has been established as the cause.
+
+Twenty-four Ozaki measurements used actual 4,096-cubed GEMMs, seeds 42/43/44,
+input scales `0.001` and `1`, and dynamic-16 or fixed 8/12/16-bit settings.
+Every run reported emulation use and explicitly exited with measurement-only
+status, without accepted timing or checksums. Dynamic relative L2 error was
+`0.026696–0.027471`; fixed 8/12-bit runs measured approximately `0.00012`,
+and fixed 16-bit runs `5.22e-7–5.40e-7`. No acceptance policy is inferred from
+these measurements.
+
+The next MoE source change expands all five affected verification paths to
+complete outputs, preserves every input ID, and rejects shape mismatches.
+A real small CPU MoE forward now proves that corruption in the final token's
+final logit is detected. Existing CUDA synchronization semantics are retained
+through the device-aware harness helper. The focused checks pass; fresh B200
+full-output validation remains required.
+
+### Wave 30: complete MoE logits and further execution defects
+
+All 18 stages on `e2271386a` drained. Fifteen of the sixteen MoE journey
+identities passed their actual configured full-output comparisons and speed
+gates. The shared default path now checks all 16,384,000 logits; pad/quant
+retains its complete configured output as well. The compiled paths expose a
+maximum difference of `0.17578125`, while most other paths measured
+`0.0078125`; pad/quant measured `0.119140625`. These pass the existing
+`rtol=0.1, atol=1.0` contract, which was not changed. They are not proof of
+bitwise equivalence or an independently calibrated accuracy policy.
+
+The fused entry exited with a native segmentation fault after timing. The
+Triton entry completed this time, so the retained crash is not specific to
+the Triton-named candidate. The next diagnostic adds matching Python debug
+symbols and Python frames, without modifying the installed interpreter.
+
+Two focused GPU fixtures still allocated the former cropped verification
+buffer. Their expected buffer now matches the complete test output and the
+assertions cover the final token and logit. The two-GPU memory-transfer
+attempt used torchrun for a binary that manages both devices itself; timing
+completed but the parent had no verification payload. Its next run will use
+the ordinary Python launcher. Reviewing that path also found a checksum-only
+comparison and a baseline check of staging memory instead of the destination;
+complete destination validation is being repaired before rerunning it.
+
+The next Llama candidate preserves eager BF16 rounding boundaries using
+per-compilation `emulate_precision_casts` options. It copies PyTorch's complete
+max-autotune profile, retaining autotuning and CUDA graphs, and leaves the
+process-global precision configuration unchanged. This follows the
+[PyTorch 2.9.1 precision option](https://github.com/pytorch/pytorch/blob/v2.9.1/torch/_inductor/config.py#L736-L743)
+and its [mode profile API](https://github.com/pytorch/pytorch/blob/v2.9.1/torch/_inductor/__init__.py#L317-L352).
+The combined focused CPU checks pass (`31 passed, 2 CUDA-only skipped`);
+the full B200 comparison and measured performance are still pending.
+
+### Wave 31: numerical progress and real factory execution
+
+All seven stages on `cc58ab1fb` drained; all 33 focused GPU tests passed.
+Preserving eager precision casts reduced the full eager-SDPA versus compiled
+SDPA violation count from 354,852 to 44,458, but did not pass the unchanged
+tolerance. Materialized attention versus compiled SDPA still had 121,388
+violations. The normal Llama benchmark therefore remains a verification
+failure; no performance win is claimed. Further diagnostics will test
+residual accumulation precision in both arms with the complete workload.
+
+The standalone Level 6 MoE factory executed its real default model twice,
+changing all 512 input IDs between calls. Every one of 16,384,000 logits was
+copied exactly into the payload and compared to an independent equivalent
+expert implementation loaded with the same weights. Both full comparisons
+passed (`max_diff=0.015625`). The separate Level 4 factory exposed an Inductor
+failure while lowering pinned host-memory allocation inside forward. Its
+reusable routing metadata is now allocated before compilation; a fresh full
+factory rerun is required to validate the fix.
+
+Both native-crash probes reached `logging.Formatter.formatTime` after the
+optimized timing phase. Matching Python debug symbols locate the fault in
+CPython's specialized attribute load; Python frames and native traces are
+retained. This identifies the crash site, not the source of the memory
+corruption. The installed runtime has not been changed, and the native
+failure remains open.
+
+### Wave 32 and the next source repairs
+
+All 18 stages on `555713f38` drained. A private, explicitly transformed Llama
+probe used FP32 residual accumulation and normalization in both arms while
+retaining BF16 model weights and attention/MLP inputs. It reduced full-output
+violations to 28 for materialized versus eager SDPA, two for eager versus
+compiled SDPA, and 23 for materialized versus compiled SDPA. These remain
+failures at the unchanged tolerance, and this diagnostic transform is not
+the checked-in model implementation.
+
+Level 4 progressed past pinned-memory allocation and exposed another cached
+tensor created inside a CUDA graph: routing token IDs were later overwritten
+by a subsequent replay. Persistent workspace ownership is being repaired
+without disabling graph compilation. The fused MoE run under Python's debug
+allocator completed its full normal benchmark successfully; GDB then returned
+an error because its post-exit commands had no stack. This control did not
+reproduce the crash and does not establish its cause or resolution.
+
+The 15 informational verification commands covering 17 identities used an
+incorrect interpreter: the private driver resolved the virtualenv executable
+symlink to system Python. Those results are retained as diagnostics and do
+not count as validation on the prepared stack. The driver now preserves the
+virtualenv path and verifies its actual interpreter prefix. The attempts also
+exposed rowwise FP8 payload conversion errors; the corrected environment and
+complete-output probes will be rerun separately from timing-jitter gates.
+
+Three further repairs are prepared for B200 validation:
+
+- The two-GPU transfer pair now checks all 104,857,600 FP32 destination
+  elements from the same binary invocation that reported timing. It initializes
+  nontrivial deterministic data and rejects truncated dumps or corruption in
+  the final element. Source/destination devices, transfer algorithms, bytes,
+  and 100 inner iterations are unchanged; validation occurs after timing.
+- NanoChat's inference pair previously inherited training initialization that
+  zeroed the final projection, making its output comparison degenerate. Both
+  arms now use deterministic nonzero synthetic inference weights and reject
+  all-zero/nonfinite logits. The candidate specializes the fixed prefill
+  shape while running mutable-cache decode through the same eager model;
+  complete B200 correctness and interleaved measurements remain required.
+- Architecture setup no longer overwrites Inductor's CUTLASS source directory
+  with the unrelated CuTe DSL package root. It preserves a valid configured
+  source tree or selects a complete explicit/vendored checkout. Focused file
+  layout tests reject DSL-only and headers-only directories. Actual backend
+  import and kernel selection still require a target-host check.
+
+Focused CPU checks for the source-directory, architecture and transfer changes
+passed (`22 passed, 1 skipped`); four NanoChat checks also passed. No shared
+Python installation, driver, permissions, or scheduler configuration changed.
+
+### Worker TLS lifetime and graph workspace repairs
+
+The native MoE crash now has a reproducible local mechanism. The repository's
+CUDA graph fallback wrote short-lived Python worker dictionaries through
+PyTorch's private native TLS API. Five CPU reproducer trials crashed after
+3–27 worker/logging cycles; independent logging, reset, thread, and Python-local
+storage controls passed. Direct native writes also crashed with joined workers,
+so changing executor shutdown would not address the ownership defect.
+
+The fallback now retains new buckets only in Python `threading.local`, while
+preserving existing native-TLS reads and unknown-key errors. The repaired exact
+path passed 100 and 1,000 cycles. Four regression tests cover real worker
+lifetimes, native-read behavior, and a disposable debug-allocator process.
+These CPU controls establish the local lifetime repair; repeated cold-cache
+normal B200 fused/Triton runs remain the target-host acceptance check.
+
+Level4 now allocates all persistent routing metadata, token IDs, workspaces,
+and cached views before compilation. This addresses the next observed failure:
+a cached token-ID tensor allocated inside a CUDA graph was later overwritten
+by graph replay. The compile mode remains `max-autotune`. CPU tests exercise
+two changing inputs against independent expert math and verify stable storage;
+the real full-size factory still requires B200 validation.
+
+Both rowwise FP8 verification paths now explicitly disable inference mode and
+dequantize tensor-subclass outputs before ordinary slicing/copy operations.
+This avoids torchao's unsupported axiswise inference-tensor reshape without
+changing shapes or tolerances. Both real torchao 0.15 emulated recipes passed,
+including capture under an inherited inference context. The CUTLASS metadata
+check also avoids importing the DSL namespace before Inductor's generators.
+
+The combined focused CPU run passed 19 tests and skipped four GPU/optional
+dependency cases. Direct B200 follow-up includes those checks, complete
+outputs, two-GPU destination validation, and the corrected informational
+runner using the prepared virtualenv executable without resolving its symlink.
+CI remains deferred until the end at the user's request.
+
+### Direct B200 follow-up at `e46514f45` (September 7 UTC)
+
+The first stages of Wave33 passed:
+
+- Focused target-host tests: `29 passed, 2 skipped`. The two optional torchao
+  recipe tests were skipped because torchao is absent from the prepared
+  virtualenv; that dependency gap is recorded separately from code validation.
+- Fused and Triton MoE each completed two normal, fresh-process harness runs
+  with distinct empty compiler-cache directories and no native crash. All four
+  full configured output comparisons passed at the unchanged declared tolerance
+  (`rtol=0.1`, `atol=1.0`), with maximum absolute difference `0.0078125`.
+- Level4's real default factory passed two different 512-token input arrays.
+  Both full 16,384,000-logit payloads exactly copied the actual model output and
+  matched an independent model loaded with identical weights (maximum absolute
+  difference `0.015625`). CUDA graph workspace reuse no longer failed.
+- The Chapter 2 native two-GPU transfer pair ran with the ordinary Python
+  launcher and verified all 104,857,600 destination elements from the timed
+  invocation. Both native and wrapper validation passed. This establishes
+  complete destination correctness on two B200s; the individual harness timing
+  is not a repeated interleaved performance result.
+
+The remaining informational examples and full-output probes continue under
+the same frozen source. Output-sensitivity failures are being investigated as
+input binding or computation issues, not dismissed as timing noise.
+
+The Chapter 12 conditional-graph wrappers are also repaired for the next GPU
+batch: their workload now describes the actual 65,536 elements, 1,024 inner
+kernel steps, and 5,000 iterations. Both native paths dump all 65,536 final
+values after timing; wrappers validate the complete file from that invocation
+instead of launching a second checksum-only verification executable. Five
+focused CPU/source checks passed; native compilation and B200 execution remain
+pending. NanoChat's generated README now describes fixed-prefill compilation
+and eager decode, with obsolete timings and guaranteed-win language removed.
+
+### Verification lifecycle and live-input corrections
+
+Wave33 finished all 33 scheduled stages. Its remaining sensitivity failures
+exposed a shared lifecycle defect: `VerifyRunner` tore down the optimized
+benchmark before asking it to rerun with perturbed input. The retained payload
+still exposed tensors, but models and buffers had already been cleared. The
+runner now performs sensitivity checking inside an initialized lifecycle and
+guarantees teardown afterward, including failure paths. The real Chapter 5
+CPU pair passes fresh-input and sensitivity checks without advisory warnings;
+an exception control verifies restored input and exactly one cleanup. Focused
+lifecycle/anti-cheat checks passed (`14 passed`), as did four CLI tests and five
+additional protection checks.
+
+Separate input-binding defects were repaired:
+
+- Chapter 5 now exposes the writable storage-backed final input batch. A
+  perturbation therefore survives the next timed disk/memmap read. Both arms
+  also respect the harness seed when creating model parameters and storage
+  inputs; their I/O and overlapping copy algorithms remain unchanged.
+- The naive/Flash blockwise KV-cache pair now exposes the live final request
+  consumed by the timed output, rather than a detached copy of request zero.
+- The FP8 family converts its current declared verification input at capture
+  time, removing stale setup-time FP16 copies, and respects the harness seed.
+  Training updates, workload sizes, and tolerances are unchanged. The three
+  optimized recipes share the verified conversion/dequantization helper.
+
+Real CPU binding tests passed (`15 passed, 6 optional-dependency skips`), and
+the actual torchao 0.15 emulated recipes passed all 14 focused checks. Combined
+target-host gate execution is the next acceptance step.
+
+Wave34 separately passed full B200 output comparisons for all three FP8
+recipes: 67,108,864 elements each, maximum absolute differences `0.06714`
+(tensorwise) and `0.07087` (both rowwise recipes). Compiled TorchAO passed all
+33,554,432 elements, maximum absolute difference `0.01836`. These use the
+existing declared tolerances; they do not calibrate those tolerances. The
+task-private environment gained the repository-pinned torchao 0.15 CUDA 13
+wheel only; its PyTorch version remained 2.9.1+cu130 and no distributions were
+removed. Nine target-host focused tests passed.
+
+The attempted Chapter 12 `bench run` was classified informational and did not
+execute the pair; its zero exit code is not GPU validation. The next explicit
+verification gate will execute the native pair. The Llama full-size diagnostic
+still failed: an FP32-residual/math-attention reference had 13 differing
+elements outside tolerance versus compiled SDPA, and eager versus compiled
+SDPA had two. NanoChat passed all 40,000 nonzero output logits but showed no
+speedup in eight interleaved observations per arm (`46.566` versus `47.801` ms).
+Both negative results are retained and remain open.
+
+### Wave35: combined target-host verification
+
+At source `a48ab0207`, all 20 scheduled stages terminated and drained. The
+focused target-host suite passed 32 tests. Fourteen of the 17 informational
+pair identities passed their configured verification gates, including the
+native conditional-graph pair, all three FP8 recipes, the storage pipeline,
+the KV-cache pair, piece graphs, inference-full, NVFP4 training, and persistent
+decode. The three FP8 and compiled-TorchAO full-output probes also passed again
+after the input-binding changes.
+
+Two execution failures remain: compiled TorchAO and pipeline parallelism raise
+an assertion during the initialized sensitivity lifecycle. Exact traceback
+probes are prepared. Inference placement still reports the expected mismatch
+between different policies; its independent policy/metric semantic validation
+is retained separately and is not counted as a pair-comparison pass.
+
+The next seed-contract patch removes setup-time reseeding in the naive/Flash
+KV-cache pair, both piece-graph paths, and both inference-full paths. Real CPU
+checks confirm different requested seeds produce different inputs/weights and
+that the inference-full pair passes fresh-input and sensitivity checks without
+warnings. Seventeen focused checks passed; target-host reruns remain pending.
+
+### Wave36: graph replay and numerical localization
+
+All four direct B200 stages completed and drained at source `a48ab0207`.
+The private NanoChat whole-request graph prototype matched all 40,000 final
+logits bitwise for the original inputs, two changed prompts, and an early
+decode-token perturbation. Twelve interleaved observations per arm measured
+median eager latency of 48.354 ms and graph latency of 24.035 ms (2.012x).
+This is diagnostic evidence: it precedes the repository implementation and
+profiler attribution and is not a published performance qualification.
+
+The repository candidate now captures the identical prefill and all 64 decode
+steps in one CUDA graph. Setup retains warmup and capture costs separately;
+timed replay overwrites every consumed KV position. Both arms preserve the
+caller's seed. New CUDA regressions compare complete outputs after changed
+prompts, an early decode change, and a repeated original request. Focused
+local checks passed 14 tests; two CUDA cases were skipped on the CPU host.
+Lint and generated README checks passed. Actual B200 source execution,
+interleaved measurements, and Nsight capture are the next acceptance steps.
+
+A separate full-size Llama diagnostic using one shared RMSNorm kernel made
+eager and compiled SDPA bitwise equal across 8,388,608 values. The math-attention
+reference still exceeded the existing tolerance at 12 values, maximum absolute
+difference 0.03235; that numerical failure remains open. Exact TorchAO and
+pipeline traces both identify a stale static-input pointer assertion in the
+legacy Inductor CUDA graph runner during repeated setup. A targeted cache
+lifetime control is prepared; no compiler mode has been reduced to bypass it.
+
+### Waves37–38: actual NanoChat replay and remaining execution repairs
+
+At source `6f1f686b3`, the normal NanoChat harness run passed with one successful
+pair and no skips. All 26 focused B200 regressions passed, including both new
+changed-input graph cases. The actual default factories then matched all
+40,000 logits bitwise for four input cases and every interleaved observation.
+Twelve observations per arm gave medians of 48.372 ms eager and 24.137 ms graph
+(2.004x). Separate three-request Nsight Systems captures passed with identical
+full outputs. These remain current-host, noncanonical measurements; setup
+warmup and capture costs are reported separately.
+
+The two-B200 transfer pair passed all 104,857,600 destination values on each
+invocation. Eight observations per arm measured median synchronized host time
+per inner copy of 14.592 ms baseline and 0.5484 ms peer transfer (26.608x).
+Both retained 400 MiB destination dumps are bitwise equal. The private profiler
+first hit a SQLite export issue and then found the ordinary binaries lacked
+NVTX instrumentation. Those failed attempts remain retained; an explicitly
+instrumented profiling build is next. No failed profiler is counted as passing.
+
+The piece-graph, inference-full, and corrected KV-cache seed gates passed.
+The two dynamic-router invocations exited successfully but their structured
+results were skips: missing multi-GPU metadata restricted them to one GPU.
+They did not execute the requested two-GPU workload. FP8 padded matmul passed its gate.
+The forward-only FP8 padded MLP and uncompiled TorchAO paths exposed detached
+verification inputs. Their payload inputs now alias the actual request; the
+FP8 path refreshes its reusable FP16 input buffer inside the timed request.
+Both pairs also preserve the caller's seed. Four real CUDA regressions are
+added; they are explicitly skipped on the CPU host pending the B200 rerun.
+
+The pipeline cache control passed only after a full compiler reset; clearing
+the generated Python-module cache alone did not help. The production repair
+gives TorchAO compiled and pipeline parallelism separate module wrappers whose
+Dynamo entries are released during teardown. It keeps their existing compiler
+modes and avoids a global reset. Twelve focused real CPU compilation/lifecycle
+tests passed; exact B200 repeated-setup acceptance remains pending.
+
+The communicator-reinitialization multi-GPU entry also needs a real torchrun
+worker and child-result transport: its previous default launcher imported
+class-only files, then the parent correctly rejected the missing payload.
+The full Llama FP32-attention diagnostic still had seven out-of-tolerance
+values; eager and compiled SDPA remained bitwise equal. These are open work,
+along with the distributed-training result contracts and runtime-specific
+CUTLASS generator/DSL namespace incompatibility.
+
+### Wave39: live inputs pass; verifier metadata ordering exposed
+
+At source `1b8caadf9`, all six direct stages drained. Sixteen focused tests
+passed on the B200 host, including all four actual CUDA input-mutation and
+restoration cases. The uncompiled TorchAO and FP8 padded MLP gates passed.
+The separate compiled TorchAO comparison again checked all 33,554,432 output
+values successfully.
+
+Both compiled verification gates progressed beyond the stale-pointer assertion.
+They then failed because the verifier read output tolerance after teardown had
+released the payload. The repair snapshots scalar tolerance metadata while the
+payload is live, allowing teardown to release compiled graph state. Its focused
+CPU lifecycle and protection checks passed (228 passed, 103 optional skips);
+the repaired B200 gates remain pending.
+
+The instrumented Chapter 2 Nsight Systems binary built and captured correctly.
+Its private report parser rejected Nsight's leading colon for the empty domain
+and expected the wrong verification category. The parser now preserves named
+domains, normalizes the empty domain, and checks `compute_kernel:verification`.
+The retained real baseline CSV passed the parser control; a complete capture
+of both arms is still required.
+
+The Chapter 4 multi-GPU pair now has an explicit two-rank NCCL worker and fresh
+full-rank result transport. It keeps one float per rank, five warmups, and five
+timed iterations. It reports synchronized host time because communicator
+creation and destruction include CPU work. Eleven focused tests and two
+hygiene checks passed; actual two-B200 execution is next. Router metadata and
+distributed-training workload/result repairs continue. No hosted CI is being
+run or used as a substitute for these runtime checks.
+
+### Wave40: transfer profiles and a stronger Llama comparison
+
+Both diagnostic stages on `1b8caadf9` completed and drained. Chapter 2's two
+instrumented Nsight Systems captures validated all 104,857,600 destination
+values. The baseline recorded 203 `cudaMemcpy` calls: 200 timed, two warmup,
+and one validation copy. The peer candidate recorded 101 `cudaMemcpyPeer`
+calls (100 timed, one warmup) plus one validation `cudaMemcpy`. Both recorded
+100 timed NVTX ranges and one verification range. This closes the Systems
+capture/parser issue; it does not imply a compute-kernel NCU result.
+
+The private Llama comparison uses identical 32-layer, 7,784,890,368-parameter
+models, batch one, and 2,048 tokens. Both arms use SDPA, FP32 residuals, and the
+same RMSNorm kernel; compilation is the measured difference. All 8,388,608
+outputs matched bitwise for eight distinct inputs and all 16 timed observations.
+Median CUDA-event time was 30.481 ms eager and 28.233 ms compiled (1.080x).
+The result supports implementing a stronger eager-SDPA baseline for an explicitly
+compile-only example. It does not close the independent manual-attention
+numerical discrepancy. Actual source factories, normal harness verification,
+and profiling must still be rerun after implementation.
+
+Compact reports, logs, CSV tables, and scripts for Waves35–40 are retained at
+`/Users/admin/.codex/artifacts/ai-perf-remaining-20260906/`. Large raw captures
+and output dumps remain in the corresponding direct-host wave directories.
+The Llama compiler also logged the existing CUTLASS generator/DSL namespace
+incompatibility; the measured run does not demonstrate CUTLASS backend coverage.
+
+### Wave41: compiled gates pass; communicator bootstrap repair
+
+The TorchAO compiled/uncompiled and pipeline gates passed on `38847c634` after
+the verifier metadata fix. Twelve focused target-host tests passed. The actual
+two-rank communicator worker exposed an NCCL bootstrap failure while repeatedly
+destroying and creating its default process group. Recreated groups reused the
+same rendezvous keys, allowing an old communicator ID to point at a closed
+socket. The worker now retains its rendezvous store and gives each generation
+an isolated prefix, synchronizing pending GPU work before destruction. The
+fresh-store regression passes; the repaired two-B200 run remains pending.
+
+A separate source audit found that both optimized ZeRO-1 scripts enabled
+hook-driven overlap without registering its required hook, then called explicit
+`optimizer.step()`, which is a no-op in that mode. They now use the explicit-step
+ZeRO-1 API, preserving accumulation and clipping, and no longer forward a DDP-only
+option into AdamW. Real one- and two-rank CPU tests compare every updated
+parameter against ordinary AdamW for three accumulated, clipped steps and verify
+replica agreement. Both passed; GPU versions remain pending. The first local
+test attempt timed out in standalone rendezvous; an explicit loopback rendezvous
+fixed the test launch. All attempts are retained.
+
+### Waves42–43: real communicator/ZeRO execution and full DDP results
+
+All seven Wave42 stages on `4d29473ac` completed and drained. Eleven focused
+tests passed, including real one- and two-B200 ZeRO-1 weight-update comparisons.
+The repaired communicator pair passed both ranks' full results. Its synchronized
+host times were 819.781 ms per reinitialization iteration and 0.061581 ms for
+communicator reuse; this is a deliberately tiny one-float setup-overhead example.
+Both optimized ZeRO-1 direct commands completed their configured 100 steps at
+hidden size 10,000 and batch 16, on one and two GPUs respectively.
+
+The normal precision harness runs also passed their configured comparisons:
+
+| Target | Baseline ms | Optimized ms | Ratio | Reported memory change |
+| --- | ---: | ---: | ---: | ---: |
+| TorchAO int8 | 8.915 | 3.239 | 2.752x | 7.99% increase |
+| FP8 padded MLP | 17.118 | 3.541 | 4.835x | 13.56% increase |
+| FP8 padded matmul | 17.242 | 2.063 | 8.357x | 32.80% increase |
+
+These are individual portable harness runs. Their public verification payloads
+still used the existing crop; separate earlier full-output probes remain distinct.
+The next source repair expands all six baseline/optimized payloads to complete
+outputs. It also removes unmeasured zero accuracy claims and labels precision
+storage ratios as theoretical, since measured total memory increased here.
+
+Wave43 on `193403499` passed all 50 focused target-host child-result tests.
+Single-GPU DDP passed an exact comparison of complete final-batch outputs after
+training, with a 1.0066x ratio below its 1.05x speed target. Two-GPU DDP executed
+both children but failed final-output comparison with maximum difference 4.375.
+That failure remains open; the optimizer and communication differences are being
+isolated without relaxing tolerance. Every rank now exports its actual full
+final batch and logits, preserves the active seed, and reports completed steps
+accurately when the loader exhausts before the requested maximum.
+
+The setup-seed sweep removed only leading fixed-seed calls from 178 examples.
+Default harness seed 42 is unchanged; seed 1042 can now reach those setups.
+All changed files parsed, and real setup tests confirmed repeatability and
+changed-input behavior. Later alignment reseeds and private generators are being
+reviewed separately. Llama's explicit compile-only source and the router's real
+integer prompt-input contract are implemented; their new B200 runs are next.
+
+### Wave44: full Llama/quantization checks and additional gate fixes
+
+All eleven direct stages on `05086530b` drained. The actual default 32-layer,
+2,048-token Llama pair passed its full-output gate and normal harness comparison
+at the unchanged 0.02/0.02 tolerance. The normal baseline measured 32.589 ms and
+the compiled candidate measured a 1.0859x ratio. Repeated interleaved source
+measurements and profiling are still pending; the earlier private diagnostic
+measurement remains separate from this source result.
+
+Both TorchAO variants and the FP8 padded MLP/matmul passed their gates after
+expanding their public payloads to complete outputs. The explicit compiled
+TorchAO normal command reported an informational entry, without a timing run;
+its successful exit is not timing evidence. The router commands likewise did
+not execute the model: their supplied model argument was lost before worker
+setup, and both were recorded as skipped. That argument-delivery defect is
+under repair.
+
+The focused GPU tests produced 84 passes and two failures in a CPU fake-vLLM
+fixture whose two-device model inherited one-device visibility from its GPU
+test shard. The fixture now declares matching visibility; all 18 fixture tests
+pass under an outer one-device environment. This is test control-flow coverage,
+not real vLLM GPU execution.
+
+The memory-bound gate exposed missing pre-setup workload metadata in the
+optimized implementation. It now exposes the same metadata as its baseline,
+releases its compiled callable during teardown, and both implementations retain
+all 16,777,216 output values instead of the first 4,096. A focused regression
+changes a value beyond the former crop and checks the complete live payload.
+The combined local regression batch passed 24 tests, with the production CUDA
+compile-path test explicitly skipped until its B200 rerun.
+
+The next seed sweep reviewed another 142 source files: it removed 274 fixed
+global resets and rebound 16 intentional alignment resets to the active harness
+seed. All changed files parsed. Four real CPU setup tests preserve legacy seed-42
+model/input/output identity and demonstrate seed-1042 sensitivity. Five private
+CUDA generator controls remain intact. Thirty worker resets across 15 files
+need explicit parent-to-worker seed transport and are being repaired separately.
+
+Compact Wave44 receipts are retained under
+`/Users/admin/.codex/artifacts/ai-perf-remaining-20260906/wave44-validation-20260907T074913Z`.
+These remain practical portable B200 checks; they do not qualify unavailable
+hardware or supply canonical locked-clock performance evidence.
+
+### Wave45: DDP optimizer attribution and manual ZeRO-1 repairs
+
+The real two-B200 factorial held each rank's complete input sequence fixed and
+varied the DDP bucket configuration and AdamW fusion independently. Both loader
+profiles produced identical batches. With the optimizer held fixed, the bucket
+change preserved every training loss and complete final logits exactly, at both
+two steps and all 32 available batches from a request for 100. Changing BF16
+AdamW from unfused to fused changed final logits by up to 4.3828125 on rank 0
+and 5.0546875 on rank 1. Both fused arms matched one another. The baseline now
+uses the same fused optimizer as its candidate, preserving an exact 0/0 output
+comparison while isolating the communication and loading changes.
+
+The first diagnostic attempt failed after executing the baseline arm because
+its tensor-hash helper attempted a byte view of a scalar loss. Flattening before
+the byte view fixed that private receipt bug. Scalar, vector, and BF16 controls
+passed, and both diagnostic stages then completed and drained. All attempts
+remain retained; the normal DDP pair still needs its new-source rerun.
+
+Source review also found that the manual ZeRO-1 sharder cleared only gradients
+owned by the local optimizer partition. Nonlocal replicated gradients survived
+into later steps. The shared implementation now clears every replicated
+gradient and broadcasts initial weights before averaging gradients. Real one-
+and two-rank CPU tests start ranks with different weights, train with distinct
+inputs, compare every parameter against ordinary AdamW after each step, and
+verify replica agreement. All four manual/library CPU cases passed; four CUDA
+cases are queued. The examples' memory demonstrations remain distinct from
+qualified baseline/candidate training comparisons.
+
+The isolated benchmark worker now receives the selected target arguments before
+importing its module, fixing import-time CLI consumers such as the vLLM router.
+A real subprocess regression computes different output from the supplied flag.
+The combined argument and DDP regression set passed 53 tests. These changes,
+the manual ZeRO-1 repair, and the DDP arithmetic alignment are pushed through
+`892fab17b`; the next direct GPU batch uses that frozen commit.
+
+### Wave46: measured Llama compilation and exact two-GPU DDP closure
+
+All eleven stages on `892fab17b` completed and drained. The actual Llama
+factories ran four ABBA blocks over eight fresh full-size inputs, with eight
+observations per arm. All parameters were identical and every complete
+8,388,608-element output was bitwise equal. Both implementations responded to
+changed inputs. Median CUDA-event times were 30.3838 ms eager and 28.1446 ms
+compiled, a 1.07956x ratio. Sample standard deviations were 0.3793 and 0.4166 ms;
+individual block ratios ranged from 1.0639x to 1.0970x.
+
+Separate Nsight Systems captures used three steady-state requests per arm.
+The eager path launched 1,731 kernels; the compiled path launched 1,443 kernels
+through exactly three CUDA graph launches, with no graph construction inside
+the measured window. The profile's complete final outputs were also bitwise
+equal. This supports the compilation mechanism for this portable B200 workload;
+it is not a locked-clock cross-machine performance guarantee.
+
+The normal two-GPU DDP comparison now passes exact full-output verification.
+It measured 84.9184 ms baseline and 84.0438 ms optimized, a 1.0104x ratio below
+the configured 1.05x speed target. Its disposition is `failed_no_speedup`, with
+the former numerical failure closed. The reported 12.7675 tokens/s remains
+under investigation and is not used to characterize this workload's throughput.
+
+The actual compiled TorchAO harness API run completed: baseline mean 8.9105 ms
+and compound INT8/compiled mean 0.4590 ms. These are individual harness timings;
+the earlier full-output gate remains separate and no quantization-only or
+repeated-measurement claim is made. cuBLAS, static routing, and DataLoader seed
+representative gates all passed.
+
+The focused batch passed 53 tests, including all four CUDA ZeRO-1 update cases,
+and exposed one new failure: changing the tail of the optimized memory-bound
+input did not change its CUDA output. The complete normal gate also failed
+output comparison. Its CPU compiled control follows all six input mutations
+exactly; warm- and cold-cache CUDA diagnostics are queued. This is an open
+correctness defect, not a tolerance adjustment.
+
+Both router commands now receive their arguments and attempt real engine
+initialization, which fails before the model workload runs. An unredirected
+source invocation is queued to retain the engine's underlying diagnostic.
+Neither failed router attempt counts as execution coverage. Compact reports
+and logs are retained under
+`/Users/admin/.codex/artifacts/ai-perf-remaining-20260906/wave46`;
+large tensor and profiler captures remain on the B200 host.
+
+### Waves47–49: compiler-state reproduction and training repairs
+
+Waves47 and48 completed and drained on `892fab17b`. The isolated memory-bound
+CUDA test passed all three cases, and the real verifier matched complete
+8,193-element outputs for seeds 42 and1042 within 7.63e-6. Repeated warm- and
+cold-cache input mutations also produced the expected changed outputs. These
+small isolated passes did not close the earlier full-size CLI failure.
+
+Wave49 uses frozen source `6fb4ec61b`. Its first three fresh-process probes
+preserve the default 16,777,216-element input and64 repeats. The ordinary
+compiler configuration passes; importing the repository architecture policy
+reproduces the full-output mismatch; retaining that policy while restoring
+CUDA graph trees passes. The architecture policy's legacy graph setting is
+therefore the repair target. The normal CLI gate and original combined test
+order still require a rerun after the source fix.
+
+The guarded router source invocation exposed the actual initialization failure:
+vLLM 0.16 assumes that an installed `flash_attn` namespace contains the legacy
+`flash_attn.ops` module, which FlashAttention 4 does not provide. The CUDA rotary
+path uses vLLM's own bundled implementation. A task-private complete vLLM wheel
+overlay with the upstream defensive-import fix is queued; its original wheel,
+source hashes, changed file, and import-resolution checks are retained. It does
+not modify the shared runtime. Model execution remains unvalidated until the
+actual engine run succeeds.
+
+The optimized DDP examples now synchronize and step the final partial gradient
+accumulation group, scale each group by its actual size, and include both forward
+and backward in `no_sync`. Seven focused CPU tests passed, including real
+one- and two-rank comparisons against a dense grouped reference for five steps
+with accumulation3, two steps with accumulation3, and ordinary accumulation1.
+Actual one- and two-B200 runs are in Wave49. The production ZeRO-2 communication
+hook also passed its real two-rank CPU reference test; its NCCL case is included
+in the same GPU batch.
+
+Fifteen chapter worker definitions and the imported chapter15 adapter now
+transport the caller's seed through the CLI and launch configuration. The
+default remains 42; five focused tests verify legacy 42 output, fresh 1042 output,
+two real Gloo ranks, and all worker call sites. Representative two-B200 launches
+are queued. Raw isolated-worker and torchrun stdout is now retained alongside
+stderr when an artifact directory is configured, before JSON extraction or
+console filtering, so native engine failures and reported metrics remain
+inspectable. Three focused subprocess controls passed.
+
+All thirteen Wave49 stages completed and drained. The focused GPU batch passed
+19 tests, including the actual NCCL ZeRO-2 case. Both two-GPU partial DDP runs
+passed, as did the explicit seed-1042 worker launch. Ordinary one- and two-GPU
+DDP comparisons retained exact full-output verification and remained below the
+1.05x speed target. The single-GPU partial DDP run exposed an initial `no_sync`
+failure with the static reducer. The repaired path keeps static DDP for the
+default accumulation of one and uses the supported reducer for accumulation.
+Real one- and two-rank CPU counterfactuals reproduced the assertion, and seven
+dense-reference regression cases passed after the fix. The B200 rerun is pending.
+
+Raw worker logs resolved the 12.7675 tokens/s anomaly: the parser accepted
+`tokens/step` as a throughput unit and read the preceding training loss, while
+the rank filter discarded the actual `toks/s per rank` summary. The parser now
+requires a complete unit and filters explicit rank labels. The actual retained
+DDP summaries report approximately 42,000–49,000 tokens/s per rank. Thirty-three
+focused controls, including a real torchrun process, passed; old published
+metrics remain preserved as rejected values rather than being rewritten.
+
+The normal chapter4 TorchComms and chapter15 disaggregated pairs exposed output
+mismatches in Wave49 despite successful child execution. Their fresh-seed
+reference construction is under investigation; neither counts as a verified
+pair. The cache-aware distributed worker now also transports the caller seed,
+with27 focused CPU tests passing and four CUDA cases pending.
+
+Wave49b completed both stages and drained on the same source. The private vLLM
+overlay resolved correctly, retained FlashAttention4 and bundled CUDA rotary,
+and the real router model workload completed with its full output captured.
+The first overlay check had incorrectly required its constructor to leave CUDA
+uninitialized; the corrected probe records that state and preserves the failed
+attempt. The baseline source run is execution evidence only. Paired dynamic
+and dual-pool router verification is running separately in Wave49c.
+
+### Waves49c–51: correctness closure and reproducible router runtime
+
+Wave50 completed ten stages on `c35f7b082`; Wave51 completed nine on `63885e8ab`.
+Every stage drained its owned processes. These remain portable, non-canonical
+direct runs on two B200s with the retained Torch 2.9.1/CUDA 13 runtime.
+
+The memory-bound failure came from disabling CUDA graph trees in the shared
+architecture policy. Retaining graph-tree ownership while leaving implicit
+graph capture disabled repairs the full 16,777,216-element, 64-repeat workload.
+The combined GPU regressions passed 61 tests in Wave50, and the normal full-output
+gate passed. One normal timing measured 2.404318 ms baseline and 0.090038 ms compiled;
+this is an observation, not a repeated interleaved performance claim. Modeled
+global traffic now distinguishes eager repeated reads/writes from the fused
+kernel's single input read and output write; it is not a measured HBM counter.
+Wave51 also passed the tightened 1e-5 relative/2e-5 absolute tolerance. A missing
+repeat is rejected by the new numerical negative control.
+
+The single-GPU DDP reducer repair passed real 5/3, 2/3 and 5/1 step/accumulation runs.
+Normal one- and two-GPU DDP pairs retained exact full-output verification and
+remained below the speed threshold. Throughput parsing now captures the actual
+per-rank summaries, approximately 41,874 and 48,497 tokens/s, rather than a loss
+value preceding `tokens/step`.
+
+The parent torchrun reference was being constructed before harness seeding.
+Moving runtime initialization before specification construction restores the
+same active seed on both sides. A real CPU torchrun test covers 42 and 1042 after
+unrelated RNG use. Wave51 then passed ordinary two-GPU TorchComms verification
+and the chapter 15 disaggregated comparison. The latter measured 1906.060 ms versus
+1890.588 ms: its 1.00818x result remains `failed_no_speedup`, with no correctness
+error. The speed requirement has not been weakened.
+
+Cache-aware input jitter had modified a saved prompt copy. Verification now
+binds a live prompt view, preferring a cold request whose complete prompt is
+processed. The real model input-mutation control and Wave51 gate passed. Its
+normal two-GPU pair measured 23.810146 ms versus 14.491368 ms and passed verification;
+the 1.64306x observation still needs an interleaved timing campaign before being
+promoted to a performance claim.
+
+Wave49c's normal dynamic-router pair passed complete token verification. Its
+31.325 s versus 29.504 s timings include engine startup on every invocation. The
+dual-pool default-backend pair failed exact tokens, and repeated optimized runs
+also differed despite identical prompts. Wave51's explicit
+`VLLM_BATCH_INVARIANT=1` plus `TRITON_ATTN` produced identical full 1,734-element
+outputs across both policies. The new `--attention-backend` option carries this
+choice into both engine configurations; the lab README gives the exact command.
+Default-backend failures remain retained, and other models require their own
+verification.
+
+The repository now contains an explicit vLLM 0.16/FlashAttention 4 backport builder.
+It checks the pinned wheel and source hashes, changes only the known rotary
+import and wheel RECORD, and verifies the installed package origin. Wave51 built
+and installed the actual wheel in a disposable composed environment, retained
+FlashAttention 4 CuTe, and imported vLLM's bundled CUDA extension. The shared
+environment was unchanged. Twenty-five focused GPU tests passed in the same
+wave. Normal router runs using this installed wheel remain the next check.
+
+The final 22 shared setup implementations now preserve the caller's active seed.
+MoE and decode retain their CUDA graph cleanup while resetting the generator to
+that active seed. CPU controls passed, and Wave52 passed 24 GPU checks before a
+new test incorrectly inspected decode output before its post-timing capture.
+That test now follows the real capture lifecycle; the failed attempt is retained
+and the corrected batch precedes the final integrated GPU suite.
+
+The baseline gradient-fusion NCU capture remains incomplete. Even with one full
+2048-tensor iteration, its five-metric application-range replay exceeded 600 s.
+Optimized NCU, Torch and Nsight Systems captures passed; this does not close the
+baseline NCU requirement. A bounded one-metric diagnostic is separate from the
+required five-metric report. Precision-policy cases, unavailable model engines,
+and hardware requirements beyond this two-GPU host retain their prior explicit
+dispositions.
+
+### Waves52–53: normal router runs and the final integrated suite
+
+The corrected fresh-seed GPU batch passed 25 checks. Two normal dual-pool runs
+using the repository-built vLLM wheel passed exact token verification, with
+baseline/optimized latencies of 29,912.564/31,365.920 ms and
+30,035.969/30,947.939 ms. Their 0.95366x and 0.97053x outcomes remain
+`failed_no_speedup`. Engine startup is included in those measurements.
+
+The final contract scan found prompt creation still reachable from the timed
+router helper. Default creation now belongs to the standalone entrypoint;
+topology-aware benchmark calls require the live input prepared during setup.
+CPU-to-Python token-list conversion is an explicit part of vLLM admission, with
+non-CPU inputs rejected before conversion. Explicit zero request-group overrides
+also remain zero instead of restoring default work. All 23 focused CPU router
+controls passed. The complete contract scan then passed 932 benchmark entrypoints
+with no errors or warnings; repository-wide Ruff correctness checks passed.
+
+The Wave52b driver stopped at a stage boundary after the second comparison and
+all its children drained, preserving the existing results and a separate boundary
+receipt. This allowed the final suite to use the latest source without changing
+a running GPU workload. On frozen `5a4798260`, Wave53 passed 28 focused GPU checks
+and both actual router factories; their complete 1,734-element outputs matched
+exactly. A private comparison command initially had a quoting error; the
+standalone reconciliation reused the retained outputs successfully in Wave53b.
+That orchestration failure remains recorded separately from model correctness.
+
+The baseline gradient-fusion one-metric NCU diagnostic completed in 26 seconds
+and emitted a report over the full 2,048-tensor iteration. This is partial
+profiler evidence, not the still-required five-metric report. Wave53b collected
+5,830 tests and started the final integrated GPU suite on the same frozen source.
+The integrated run completed all 5,830 cases: 5,722 passed, 78 skipped, and
+30 failed in 42m52s. Its JUnit report is retained. After the summary was written,
+pytest shutdown waited on surviving compiler work from a timed-out test. The
+owned stage supervisor received SIGTERM and drained its process tree; its
+process exit is therefore 143, distinct from the completed test counts.
+
+### Wave53b failure repairs and Wave54 profiler control
+
+The failures identified additional tests that assumed setup would silently reset
+seed 42. Paired and repeated fixtures now seed each setup explicitly, exercise
+42 and 1042, and restore the caller's RNG state. Complete output checks and
+numerical tolerances remain intact. Eight hygiene assertions were updated for
+full verification buffers and the current graph lifecycle. Other stale assertions
+now recognize the explicit distributed seed adapter, the isolated compiled-model
+wrapper, and separate eager/fused memory-traffic models. Focused CPU batches
+passed 553 tests with one skip, 82 tests with eight skips, and 10 tests with nine
+skips; the latest GPU fixture rerun remains pending.
+
+README generation now preserves the explicit vLLM/FA4 backport instructions and
+the actual Wave46 Llama measurements. All 12 README checks passed. The integrated
+Llama compile test exceeded its 600-second limit while awaiting autotune
+compilation; its isolated rerun remains pending, separate from the earlier
+successful full-model execution.
+
+Wave54 requested all five minimal NCU metrics without adding `--set basic` on
+the unchanged full 2,048-tensor, two-GPU baseline. It advanced to replay pass four
+but hit its three-minute bound. Cleanup succeeded; replay/kernel-count diagnostics
+were retained. This is an incomplete capture and does not establish that removing
+the section set fixes the profiler. Hosted CI and main merges remain pending.
+
+### Wave55: all affected GPU files and standalone MoE pass
+
+On frozen `9d342cc79`, all 813 tests across the thirteen affected files passed
+in 49.32 seconds. All six tests in the separately executed Llama file passed in
+2.90 seconds, including the real CUDA compilation case. The standalone MoE
+level-zero entrypoint then completed its normal 436.5M-parameter, 512-token
+workload and five measured iterations. All three stages exited zero and drained.
+These results close the thirty diagnostic failures through focused validation;
+the original integrated run remains recorded with its original failures.
+
+The all-target README check found two additional generator omissions in the
+router and cache-aware labs. Their tested commands and topology limitations now
+survive regeneration, and the regression checks every generator-owned README.
+All twelve README tests passed. A final ten-minute, full-workload five-metric
+NCU control is running separately; no profiler command-builder change is claimed
+from an incomplete capture.
+
+### Waves56–57: exact profiler metrics and retained replay intermittency
+
+The longer ten-minute control completed the unchanged full 2,048-tensor baseline
+and passed strict report inspection. Its 134,453,562-byte report contains the
+selected range and all five minimal metrics, with SHA-256
+`a44b04d359a252f7a292326b227cc29be29ef5a4a31d5a347042fea3c7f6cb46`.
+The earlier three-minute timeout remains an incomplete attempt.
+
+Commit `d6aee0cfe` fixes both NCU builders to omit the extra section set only in
+application-range mode. Other replay modes retain their existing policy. All
+67 controls passed on CPU and again on B200. The real standalone builder's
+optimized capture also passed strict inspection, with report SHA-256
+`9b42ecb806a7add12750c2adc0c17d0b88aab90097765aca03ad8d64ee9087bc`.
+The real harness builder's baseline repeat reached replay pass six but timed out
+after ten minutes and drained successfully. The profiler binary and requested
+metrics matched the successful control. Removing surplus metrics is correct,
+but stable baseline replay is not established; the intermittent Nsight/NCCL
+limitation is retained explicitly.
+
+### Final CI bootstrap repair
+
+The first completed final CI run on `d6aee0cfe` reported 5,306 passed, 535 skipped,
+and four failed tests. All four failures were the same test-launcher import
+defect: a directly executed distributed test script could not import `core`
+without an inherited `PYTHONPATH`. The launcher now uses module execution from
+the code root and deliberately excludes inherited `PYTHONPATH`. This changes the
+test bootstrap, not the optimizer arithmetic or its strict comparisons. Its
+fresh validation and final CI outcome are tracked in
+[PR #21](https://github.com/cfregly/ai-performance-engineering/pull/21).
+
+### Wave58 and final CI: distributed bootstrap passes, fixes merged
+
+On `d77181e28`, all eight distributed optimizer worker cases passed on B200 in
+31.27 seconds: manual and Torch optimizers, one and two ranks, CPU and CUDA.
+The stage exited zero and drained. Final hosted benchmark validation then passed
+with 5,310 tests passed, 535 skipped, and no failures or errors; static analysis,
+dashboard checks, and dual-architecture CUDA builds also passed.
+
+PR #21 merged into `main` as `8148660617a145ae87f5a42b7c5d765243e08915`;
+PR #20 is also merged. The merge tree is identical to tested `d77181e28`.
+After the preceding GPU stages drained, the direct checkout was fast-forwarded
+to that merge. Wave59 collected all 5,845 tests and started a fresh full GPU
+suite with both B200s visible. Its final test and process-cleanup outcomes remain
+pending; the merge itself does not close that validation step.
+
+### Wave59: full merged-source run, one repeated compiler timeout
+
+All 5,845 cases completed on `814866061`: 5,766 passed, 78 skipped, and one
+failed in 41 minutes 52 seconds. The remaining failure was the Llama CUDA
+numerical test's 600-second autotune limit. Live process inspection showed
+continuing native CUTLASS template builds. After the complete XML was retained,
+pytest shutdown still awaited compiler work; the owned supervisor was signaled,
+drained its children, and returned 143. That process disposition is separate
+from the test counts. The XML SHA-256 is
+`16c72d1b262ac3de6d7eaeb9d2bb0b2f98b91daf19332facf79d1560627b5299`.
+
+A repair now places the unchanged two-input numerical workload in a fresh
+interpreter and scopes native worker cleanup to that process group. Five CPU
+tests passed and the CUDA case skipped locally; GPU acceptance is pending.
+Wave60 first repeats the unmodified isolated CUDA case, then runs the supported
+opt-in ZeRO, distributed Blackwell, and local-model routing checks, followed by
+full-workload memory/cache ABBA measurements and profiler inspection. Other
+hardening skips remain explicit where production detectors do not exist.
+
+### Wave60: opt-in coverage and repeated performance evidence
+
+On unchanged `814866061`, the isolated Llama case passed in 2.755 seconds,
+the real two-rank ZeRO2 case passed, both Blackwell tests passed on each rank,
+and local-model vLLM passed in 30.893 seconds. All stages drained.
+
+Full-workload memory ABBA measured 31.74309x from eight observations per arm
+across four fresh seeds. Baseline/optimized medians were 2.387228/0.075205 ms,
+with standard deviations 0.006990/0.010427 ms. Every full 16,777,216-element
+comparison passed the existing tolerances; maximum absolute error was
+0.00001144409. Both Nsight Systems and five-metric Nsight Compute captures
+completed. The first private inspection script assumed a long-form CSV and
+failed on NCU's wide format; the corrected inspector verified all requested
+columns, finite values, units, report hashes and the 128-to-one kernel reduction.
+The original inspection failure remains retained alongside the successful check.
+
+Cache-aware two-GPU ABBA passed all full 2,048-element comparisons exactly but
+measured **0.988428x**, with medians 14.331648/14.499441 ms and standard deviations
+0.470046/0.517233 ms. Four fresh seeds, eight observations per arm and both-arm
+Nsight Systems traces are retained. The earlier single-run 1.64306x was not
+reproduced. These are portable unlocked observations; the single decode rank
+cannot qualify migration improvements between decode ranks.
+
+### Wave61: compiler isolation and newly merged lab coverage
+
+After all prior stages drained, the checkout advanced to `46ba89929`, including
+the compiler-process repair and the newly merged Colfax lab additions. The
+Llama CUDA case passed with full-suite collection, then passed again in 5.625
+seconds inside the integrated suite. The completed run passed **5,795 tests**,
+with **79 skips and zero failures or errors**, in 1,888.955 seconds. Both stages
+exited zero and drained normally. Its complete XML SHA-256 is
+`94638463093ee4a2d7983fa6dbaacef4e74f360c9447e20fa6512652e7f9c0c2`.
+
+The new Colfax README additions initially failed the generator synchronization
+check. Their content now survives regeneration; the focused local batch passed
+45 tests with two CUDA skips. Decode and backward dependencies were installed
+in separate copies of the task environment, retaining PyTorch 2.9.1+cu130 and
+verifying the donor was unchanged. Package installation and source pin checks
+are preflight only; real Colfax GPU validation is next.
+
+The subsequent Colfax source review extended verification from selected files
+to all 52 runtime Python files plus the installed VCS repository, exact commit,
+and package subdirectory. The GPU test now changes Q or dO in place on the same
+graph and checks fresh outputs against an independent reference before restoring
+the input. The local focused batch passed 48 tests with two CUDA skips. These
+newer Colfax repairs still need their own GPU execution; the integrated suite
+above used the preceding source revision.
+
+### Waves62–63: Colfax execution repair and complete paired validation
+
+Wave62 passed all 32 opt-in GPU tests in each pinned environment. Full-default
+ABBA comparisons passed, but the normal decode harness rejected output exposed
+during graph capture as setup pre-computation. Backward's tuple output did not
+trigger that detector. The fix keeps graph-owned storage private until a real
+replay publishes the output; it preserves capture, workload, and tolerances.
+The GPU regression now runs the actual setup detector before poisoning output
+buffers and checking changed inputs on the same graph.
+
+On repaired `356490bd1`, Wave63 completed all seven stages with zero exits and
+normal process drain. Both 32-case GPU suites passed with no skips. Both normal
+deep-dive harness runs passed full verification and all three profiler captures.
+Normal speed ratios were 1.170342x decode and 1.094264x backward.
+
+The four-seed ABBA repeats produced eight observations per arm. Decode medians
+were 1.056113/0.900269 ms (1.173108x), with standard deviations
+0.000819/0.000216 ms. Backward medians were 30.557050/28.269385 ms (1.080924x),
+with standard deviations 0.398677/0.072006 ms. Every complete 32,768-element
+decode and 402,653,184-element gradient comparison matched exactly, before and
+after timing in every block. All eight Nsight reports passed inspection,
+including the five requested NCU metrics. The inspection receipt SHA-256 is
+`c997356673c44cf699a4aa6f24e32fb49cb14511b8ddb2834b8c4d5b760c2f04`.
+These portable current-host measurements do not establish canonical hardware
+expectations or directly trace internal TMEM/barrier ordering. The original
+Wave62 failure remains retained.
+
+The refreshed repository-wide scan checked 936 entrypoints with zero errors or
+warnings; Ruff correctness checks passed. Final hosted CI and delivery of these
+last repairs remain pending.
+
+### Wave64: retained distributed profiler driver failure
+
+On final PR source `568c9102c`, the 67 focused profiler regressions passed.
+The unchanged two-B200 baseline then requested all five metrics through the
+repository application-range command builder under a 900-second bound. NCU
+reported a driver `UnknownError`. After the error and process identity were
+preserved, the owned supervisor received SIGTERM; all owned workers drained
+and the stage returned 143. No complete report was accepted from this attempt.
+This retains the earlier successful captures and failed repeat without claiming
+stable replay or attributing an unproven defect to the benchmark source.
+
+The final skip reconciliation found 58 tests explicitly naming unimplemented
+production protections and one additional skipped test that rejects test-name
+counts as behavioral coverage. Other skips include CPU-only negative controls,
+unavailable resources and opt-in cases executed separately. These counts do
+not turn missing protections into passing hardening evidence.
+
+### Wave65: execute the version-specific FP8 template
+
+The remaining FP8 template test intentionally targets Transformer Engine 2.18;
+earlier TE 2.9 coverage exercised a different autocast API. Its first isolated
+build failed because optional NCCL expert parallelism referenced a header absent
+from PyTorch 2.9. The second isolated build used NVIDIA's explicit
+[`NVTE_WITH_NCCL_EP=0` build option](https://github.com/NVIDIA/TransformerEngine/blob/v2.18/build_tools/pytorch.py#L82-L90).
+It retained PyTorch 2.9.1+cu130 and left all donor environments unchanged. This
+build covers the FP8 Linear template and does not qualify expert parallelism.
+
+On source `568c9102c`, the runtime identity check confirmed TE 2.18.0 and B200
+SM100. The exact CUDA test
+`tests/test_audit_wave1_tooling_regressions.py::test_fp8_template_executes_real_transformer_engine_linear`
+passed with no skip, retaining its original full-output numerical smoke check.
+Both stages exited zero and drained normally. The failed installation, successful
+build, package versions, explicit build scope, test XML and cleanup receipts are
+retained separately.
+
+### Final CI and source delivery
+
+All final checks passed on PR head `568c9102c891cdc14eba5fe956cc03d702fb176e`.
+[Benchmark validation](https://github.com/cfregly/ai-performance-engineering/actions/runs/34157897194)
+completed with 5,341 CPU tests passed, 536 skipped and zero failures or errors
+across 5,877 cases in 1,411.663 seconds. Static analysis and dashboard checks
+passed. [Dual-architecture compare builds](https://github.com/cfregly/ai-performance-engineering/actions/runs/34157897282)
+also passed for all configured CUDA targets. The retained CPU XML SHA-256 is
+`a8574cf6bd4365e47b56a9acff23fccf1838f6b0c78c7255bde1e220abd3c629`.
+
+[PR #23](https://github.com/cfregly/ai-performance-engineering/pull/23) merged
+normally as `a8e0b5b21388ed3e3545301b2a84fca8a6a8d864` on September 7, 2026.
+Its tree matches the CI-tested head. This includes the previously committed
+local repairs; earlier repair PRs #20 and #21 are also merged. This final
+documentation update records the later profiler failure, TE 2.18 execution,
+skip reconciliation and CI results without changing executable source.
+
+Available one- and two-B200 execution is complete and all owned processes have
+drained. Missing hardware/model assets, independent approximate-kernel accuracy
+budgets, explicitly unimplemented protections and the distributed NCU driver
+failure remain documented limitations. No-speedup measurements remain valid
+negative results, and no universal fastest-performance claim is made.

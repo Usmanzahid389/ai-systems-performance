@@ -1,0 +1,38 @@
+{
+  "decode": {
+    "repository": "https://github.com/Dao-AILab/flash-attention",
+    "pr": 2817,
+    "commit": "a93c9a8fb95516a08e0974743bd5723122613377",
+    "article": "https://research.colfax-intl.com/optimization-diaries-s-p-ping-pong-for-flashattention-4-decode/",
+    "installed_vcs": {
+      "distribution": "flash-attn-4",
+      "subdirectory": "flash_attn/cute",
+      "metadata": "direct_url.json"
+    },
+    "python_source_tree": {
+      "format": "sha256-path-content-sha256-v1",
+      "include": "**/*.py",
+      "excluded_generated": ["**/__pycache__/**", "**/*.pyc", "../flash_attn_4-*.dist-info/**"],
+      "file_count": 52,
+      "sha256": "5fc8266486cef1883118d18278eefe4d320556c32365b59f842649827354117a"
+    }
+  },
+  "backward": {
+    "repository": "https://github.com/Dao-AILab/flash-attention",
+    "pr": 2804,
+    "commit": "c33d03d9f3edc850ecb5e21466d5dd31331ca7b6",
+    "article": "https://research.colfax-intl.com/optimization-diaries-improving-flashattention-4-backward-for-head-dimension-64/",
+    "installed_vcs": {
+      "distribution": "flash-attn-4",
+      "subdirectory": "flash_attn/cute",
+      "metadata": "direct_url.json"
+    },
+    "python_source_tree": {
+      "format": "sha256-path-content-sha256-v1",
+      "include": "**/*.py",
+      "excluded_generated": ["**/__pycache__/**", "**/*.pyc", "../flash_attn_4-*.dist-info/**"],
+      "file_count": 52,
+      "sha256": "019cd50a4f70211405703f926cd64f691c71e03773a722bb49ea878a2552a5ba"
+    }
+  }
+}

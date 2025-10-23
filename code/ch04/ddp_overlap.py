@@ -1,0 +1,308 @@
+"""ddp_overlap.py - Overlap-enabled DDP path with real distributed launch only."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.optim as optim
+
+from ch04.ddp_overlap_result import (
+    LEARNING_RATE,
+    RESULT_CALLBACK,
+    SEED,
+    DdpOverlapChildResultMixin,
+    DdpOverlapWorkloadResult,
+    make_result_contract,
+    run_ddp_overlap_worker,
+)
+from ch04.distributed_helper import setup_single_gpu_env
+from core.benchmark.gpu_requirements import require_min_gpus
+from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.harness import arch_config as _arch_config_patch  # noqa: F401
+from core.harness.benchmark_harness import (
+    BaseBenchmark,
+    BenchmarkConfig,
+    LaunchVia,
+    TorchrunLaunchSpec,
+    WorkloadMetadata,
+)
+from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
+from core.utils.compile_utils import enable_tf32
+
+# Ensure consistent TF32 state before any operations (new API only)
+enable_tf32()
+
+
+class MultiLayerNet(nn.Module):
+    """Multi-layer network for benchmarking."""
+
+    def __init__(self, size: int) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(size, size)
+        self.fc2 = nn.Linear(size, size)
+        self.fc3 = nn.Linear(size, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.relu_(self.fc1(x))
+        x = torch.relu_(self.fc2(x))
+        return self.fc3(x)
+
+
+def _run_overlap_step(
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    data: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Run the optimized DDP forward, backward, and update."""
+    output = model(data)
+    loss = nn.functional.mse_loss(output, target)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    return output
+
+
+class OptimizedOverlapDdpBenchmark(
+    DdpOverlapChildResultMixin,
+    VerificationPayloadMixin,
+    BaseBenchmark,
+):
+    """Overlap-enabled DDP benchmark with real bucketed collectives."""
+
+    multi_gpu_required = True
+
+    def __init__(self):
+        super().__init__()
+        self.device = torch.device("cuda")
+        self.model = None
+        self.optimizer = None
+        self.data = None
+        self.target = None
+        self.output = None
+        self.rank = 0
+        self.world_size = 1
+        self.initialized = False
+        self.batch_size = 128
+        self.hidden_size = 1024
+        self._enable_nvtx = False
+        self._payload_parameter_count = 0
+        tokens = self.batch_size * self.hidden_size
+        self._workload = WorkloadMetadata(
+            requests_per_iteration=float(self.batch_size),
+            tokens_per_iteration=float(tokens),
+        )
+
+    def setup(self) -> None:
+        """Setup real DDP with overlap optimizations."""
+        require_min_gpus(2, "ddp_overlap.py")
+        self.rank, self.world_size, local_rank = setup_single_gpu_env(
+            "ddp_overlap",
+            min_world_size=2,
+        )
+        torch.cuda.set_device(local_rank)
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl", device_id=local_rank)
+            self.initialized = True
+        self.device = torch.device(f"cuda:{local_rank}")
+
+        torch.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
+        model = MultiLayerNet(self.hidden_size).to(self.device)
+
+        # Enable DDP with gradient_as_bucket_view for overlap
+        if self.world_size > 1:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+
+            self.model = DDP(
+                model,
+                # The worker places both the module and its inputs on the
+                # rank-local device.  Leaving device_ids unset avoids DDP's
+                # per-forward input routing without changing gradient sync.
+                device_ids=None,
+                gradient_as_bucket_view=True,  # Key optimization for overlap
+                broadcast_buffers=False,
+                static_graph=True,  # Additional optimization
+            )
+        else:
+            self.model = model
+
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
+        self.optimizer = optim.SGD(self.model.parameters(), lr=LEARNING_RATE)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
+
+        self.data = torch.randn(self.batch_size, self.hidden_size, device=self.device)
+        self.target = torch.randn(self.batch_size, 1, device=self.device)
+        torch.cuda.synchronize()
+
+    def benchmark_fn(self) -> None:
+        """Benchmark a step that overlaps gradient synchronization with backward."""
+        with nvtx_range("overlap_ddp", enable=self._enable_nvtx):
+            output = _run_overlap_step(
+                self.model,
+                self.optimizer,
+                self.data,
+                self.target,
+            )
+        self.output = output.detach_()
+
+    def capture_verification_payload(self) -> None:
+        if self.data is None or self.target is None or self.output is None:
+            raise RuntimeError(
+                "setup() and benchmark_fn() must be called before capture_verification_payload()"
+            )
+        self._set_verification_payload(
+            inputs={"data": self.data, "target": self.target},
+            output=self.output,
+            batch_size=int(self.batch_size),
+            parameter_count=self._payload_parameter_count,
+            precision_flags={
+                "fp16": False,
+                "bf16": False,
+                "fp8": False,
+                "tf32": torch.backends.cuda.matmul.allow_tf32
+                if torch.cuda.is_available()
+                else False,
+            },
+            output_tolerance=(0.1, 1.0),
+        )
+
+    def teardown(self) -> None:
+        """Teardown: Clean up resources."""
+        if dist.is_initialized() and self.initialized:
+            dist.destroy_process_group()
+        self.model = None
+        self.optimizer = None
+        self.data = None
+        self.target = None
+        torch.cuda.empty_cache()
+        self._config = None
+
+    def get_config(self) -> BenchmarkConfig:
+        """Return benchmark configuration."""
+        return BenchmarkConfig(
+            launch_via=LaunchVia.TORCHRUN,
+            nproc_per_node=max(torch.cuda.device_count(), 2),
+            iterations=10,
+            warmup=5,
+            enable_memory_tracking=False,
+            enable_profiling=False,
+            multi_gpu_required=True,
+        )
+
+    def validate_result(self) -> Optional[str]:
+        """Validate benchmark result."""
+        if self._ddp_overlap_result_context is not None:
+            if self._ddp_overlap_result_bundle is None:
+                return "Fresh full-rank optimized DDP worker output is missing"
+            return None
+        if self.model is None:
+            return "Model not initialized"
+        if self.data is None:
+            return "Data tensor not initialized"
+        if self.target is None:
+            return "Target tensor not initialized"
+        # Check that model can produce valid output
+        try:
+            with torch.no_grad():
+                test_output = self.model(self.data)
+                if test_output.shape[0] != self.batch_size:
+                    return f"Output batch size mismatch: expected {self.batch_size}, got {test_output.shape[0]}"
+        except Exception as e:
+            return f"Model forward pass failed: {e}"
+        return None
+
+    def get_workload_metadata(self) -> Optional[WorkloadMetadata]:
+        return self._workload
+
+    def get_custom_metrics(self) -> Optional[dict]:
+        """Return domain-specific metrics using standardized helper."""
+        from core.benchmark.metrics import compute_memory_transfer_metrics
+
+        return compute_memory_transfer_metrics(
+            bytes_transferred=self._bytes_transferred
+            if hasattr(self, "_bytes_transferred")
+            else float(getattr(self, "N", 1024) * 4),
+            elapsed_ms=getattr(self, "_last_elapsed_ms", None),
+            transfer_type="hbm",
+        )
+
+    def get_verify_output(self) -> torch.Tensor:
+        """Return output tensor for verification comparison."""
+        return super().get_verify_output()
+
+    def get_input_signature(self) -> dict:
+        """Return input signature for verification."""
+        return super().get_input_signature()
+
+    def get_output_tolerance(self) -> tuple:
+        """Return tolerance for numerical comparison."""
+        return (0.1, 1.0)
+
+    def _prepare_verification_payload(self) -> None:
+        if self._ddp_overlap_result_context is not None:
+            self.require_ddp_overlap_child_result()
+            return
+        self.setup()
+        try:
+            self.benchmark_fn()
+            self.capture_verification_payload()
+            self._subprocess_verify_output = self.get_verify_output()
+            self._subprocess_output_tolerance = self.get_output_tolerance()
+            self._subprocess_input_signature = self.get_input_signature()
+        finally:
+            self.teardown()
+
+    def get_torchrun_spec(self, config: Optional[BenchmarkConfig] = None) -> TorchrunLaunchSpec:
+        effective = config or self.get_config()
+        if int(effective.nnodes or 1) != 1:
+            raise RuntimeError("DDP overlap child-result transport requires nnodes == 1")
+        world_size = int(effective.nproc_per_node or 0)
+        if world_size < 2:
+            raise RuntimeError("DDP overlap child-result transport requires at least two ranks")
+        iterations = int(effective.iterations or 0)
+        warmup = int(effective.warmup or 0)
+        contract = make_result_contract(
+            variant="overlap",
+            world_size=world_size,
+            batch_size=self.batch_size,
+            hidden_size=self.hidden_size,
+            iterations=iterations,
+            warmup=warmup,
+            seed=SEED,
+            learning_rate=LEARNING_RATE,
+        )
+        result_env = self.prepare_ddp_overlap_child_result(contract)
+        return TorchrunLaunchSpec(
+            script_path=Path(__file__).resolve().with_name("ddp_worker.py"),
+            script_args=["--variant", "overlap"],
+            env=result_env,
+            multi_gpu_required=True,
+            name="optimized_overlap",
+            result_callback=RESULT_CALLBACK,
+            timing_source="rank0_time_per_iter_ms",
+            timing_iterations_per_sample=iterations,
+            config_arg_map={
+                "iterations": "--iterations",
+                "warmup": "--warmup",
+            },
+        )
+
+
+def get_benchmark() -> BaseBenchmark:
+    """Factory function for benchmark discovery."""
+    return OptimizedOverlapDdpBenchmark()
+
+
+def _run_worker(iterations: int, warmup: int) -> DdpOverlapWorkloadResult:
+    return run_ddp_overlap_worker(
+        OptimizedOverlapDdpBenchmark(),
+        variant="overlap",
+        iterations=iterations,
+        warmup=warmup,
+    )

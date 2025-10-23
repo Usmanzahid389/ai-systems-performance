@@ -1,0 +1,25 @@
+# Example frozen workload contract for core.optimization.campaign.
+# Copy this file and replace every placeholder before initializing a campaign.
+
+schema_version: 1
+workload:
+  name: replace-with-benchmark-target
+  command:
+    - python
+    - -m
+    - cli.aisp
+    - bench
+    - run
+    - replace-with-target
+  primary_cases:
+    - representative
+  guard_cases:
+    - boundary
+measurement:
+  metric: latency_ms
+  direction: lower
+  warmup_iterations: 10
+  measured_iterations: 30
+correctness:
+  verifier: replace-with-verifier
+  required: true

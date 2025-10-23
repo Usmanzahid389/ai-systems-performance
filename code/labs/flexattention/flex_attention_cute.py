@@ -1,0 +1,165 @@
+"""FlexAttention CuTe (FlashAttention-4) tool.
+
+This is a utility script (not a baseline/optimized benchmark pair). It validates
+the public FlashAttention-4 CuTe backend without changing the repository's
+default FlashAttention-2 environment.
+
+Run from the dedicated environment documented in this lab's README:
+  python -m labs.flexattention.flex_attention_cute [args...]
+"""
+
+from __future__ import annotations
+
+import argparse
+from importlib import metadata
+
+import torch
+
+from core.benchmark.numerical_accuracy import assert_low_precision_attention_accuracy
+from labs.flexattention.flexattention_common import build_qkv_inputs, resolve_device
+
+CUTE_ENVIRONMENT_VERSIONS = {
+    "torch": "2.9.1+cu130",
+    "flash-attn-4": "4.0.0b19",
+    "nvidia-cutlass-dsl": "4.5.2",
+    "quack-kernels": "0.5.0",
+}
+CUTE_REQUIREMENTS_PATH = "labs/flexattention/requirements_cute.txt"
+
+
+def to_cute_layout(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    """Convert public BHSD inputs to the CuTe interface's contiguous BSHD layout."""
+    if q.ndim != 4 or q.shape != k.shape or q.shape != v.shape:
+        raise ValueError("q/k/v must have matching [B,H,S,D] shapes")
+    return tuple(tensor.transpose(1, 2).contiguous() for tensor in (q, k, v))
+
+
+def _resolve_cute_forward():
+    mismatches = []
+    for distribution, expected in CUTE_ENVIRONMENT_VERSIONS.items():
+        try:
+            actual = metadata.version(distribution)
+        except metadata.PackageNotFoundError:
+            mismatches.append(f"{distribution} is missing")
+            continue
+        if actual != expected:
+            mismatches.append(f"{distribution}=={actual}, expected {expected}")
+    if mismatches:
+        details = ", ".join(mismatches)
+        raise RuntimeError(
+            "The dedicated FlashAttention-4 CuTe environment is required. "
+            f"Install {CUTE_REQUIREMENTS_PATH} in a separate environment. "
+            f"Observed: {details}"
+        )
+
+    try:
+        flash_attn_2_version = metadata.version("flash-attn")
+    except metadata.PackageNotFoundError:
+        pass
+    else:
+        raise RuntimeError(
+            "The dedicated FlashAttention-4 CuTe environment must not contain "
+            f"flash-attn=={flash_attn_2_version}. Keep FlashAttention 2 in the default "
+            "repository environment."
+        )
+
+    try:
+        from flash_attn.cute import flash_attn_func
+    except ImportError as exc:
+        raise RuntimeError(
+            "The pinned flash-attn-4 package must export public "
+            "flash_attn.cute.flash_attn_func"
+        ) from exc
+    if not callable(flash_attn_func):
+        raise RuntimeError("flash_attn.cute.flash_attn_func must be callable")
+    return flash_attn_func
+
+
+def extract_cute_output(result) -> torch.Tensor:
+    """Read the output tensor from the pinned public FA4 pair."""
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise RuntimeError("flash_attn.cute.flash_attn_func must return (output, logsumexp)")
+    output, logsumexp = result
+    if not isinstance(output, torch.Tensor):
+        raise RuntimeError("FlashAttention-4 output must be a tensor")
+    if logsumexp is not None and not isinstance(logsumexp, torch.Tensor):
+        raise RuntimeError("FlashAttention-4 logsumexp must be a tensor or None")
+    return output
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the FlashAttention CuTe forward kernel.")
+    parser.add_argument("--batch", type=int, default=2)
+    parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--head-dim", type=int, default=64)
+    parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iters", type=int, default=50)
+    parser.add_argument("--tf32", action="store_true", help="Enable TF32 matmul (mostly irrelevant for bf16/fp16).")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    if min(args.batch, args.heads, args.seq_len, args.head_dim, args.iters) <= 0 or args.warmup < 0:
+        raise ValueError("Dimensions/iters must be positive and warmup must be nonnegative")
+    device = resolve_device()
+    forward = _resolve_cute_forward()
+    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
+    torch.backends.cuda.matmul.allow_tf32 = bool(args.tf32)
+
+    q, k, v = build_qkv_inputs(
+        batch=args.batch,
+        heads=args.heads,
+        seq_len=args.seq_len,
+        head_dim=args.head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    q, k, v = to_cute_layout(q, k, v)
+
+    with torch.inference_mode():
+        for _ in range(args.warmup):
+            forward(q, k, v)
+        torch.cuda.synchronize()
+
+    count = int(args.iters)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    with torch.inference_mode():
+        current_stream = torch.cuda.current_stream(device)
+        start.record(current_stream)
+        for _ in range(count):
+            out = forward(q, k, v)
+        end.record(current_stream)
+        end.synchronize()
+    elapsed_s = start.elapsed_time(end) / 1000.0
+
+    output_tensor = extract_cute_output(out)
+    if output_tensor.shape != q.shape:
+        raise RuntimeError(f"CuTe returned {tuple(output_tensor.shape)}, expected BSHD {tuple(q.shape)}")
+    # Validate the real backend before printing a timing. Layout conversion is
+    # outside timing, and the independent PyTorch reference uses BHSD.
+    with torch.inference_mode(), torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.MATH]):
+        reference = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2).double(),
+            k.transpose(1, 2).double(),
+            v.transpose(1, 2).double(),
+        ).transpose(1, 2)
+    assert_low_precision_attention_accuracy(output_tensor, reference)
+    tokens = float(args.batch * args.seq_len)
+    iters = float(count)
+    ms_per_iter = (elapsed_s * 1e3) / max(iters, 1.0)
+    tok_per_s = (tokens * iters) / max(elapsed_s, 1e-12)
+
+    print(f"CuTe FlashAttention fwd: {ms_per_iter:.4f} ms/iter, {tok_per_s:,.0f} tokens/s")
+    print(f"Output: shape={tuple(output_tensor.shape)}, dtype={output_tensor.dtype}, device={output_tensor.device}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,792 @@
+"""
+PyTorch 2.10 Symmetric Memory Example
+Demonstrates ultralow-latency cross-GPU access using torch.distributed.nn.SymmetricMemory.
+
+Requirements:
+- PyTorch 2.10+
+- Multi-GPU system (2+ GPUs)
+- CUDA 13.0+
+- NCCL 2.28+
+
+Expected Runtime: ~5-10 seconds on 2 GPUs
+"""
+import argparse
+import os
+import time
+
+import torch
+import torch.cuda.nvtx as nvtx
+import torch.distributed as dist
+
+from ch04.distributed_helper import run_main_with_skip_status, setup_single_gpu_env
+from ch04.nvshmem_child_result import NVSHMEMWorkloadResult
+from core.common.device_utils import resolve_local_rank
+from core.common.grace_platform import host_grace_soc_id, host_link_flags
+from core.optimization.symmetric_memory_patch import (
+    SymmetricMemoryBackend,
+    create_symmetric_memory_handle,
+    maybe_create_symmetric_memory_handle,
+)
+from core.profiling.nvtx_helper import nvtx_range, standardize_nvtx_label
+
+TRADITIONAL_RING_NVTX_RANGE = "transfer_sync:symmetric_memory_traditional_ring"
+SYMMETRIC_RING_NVTX_RANGE = "transfer_sync:symmetric_memory_direct_ring"
+TRADITIONAL_RING_TRANSPORT_BACKEND = "NCCL"
+SYMMETRIC_RING_TRANSPORT_BACKEND = "CUDA"
+# NVIDIA specifies NVLink-C2C at 900 GB/s bidirectional, so one copy direction peaks at 450 GB/s.
+_C2C_PEAK_PER_DIRECTION_GBPS = 450.0
+
+
+def _make_rank_generator(
+    device: torch.device | str,
+    *,
+    rank: int,
+    base_seed: int = 42,
+) -> torch.Generator:
+    """Build a rank-local input generator without changing harness RNG seeds."""
+    return torch.Generator(device=device).manual_seed(base_seed + rank)
+
+
+def _require_single_node_nccl_world(world_size: int) -> str:
+    """Validate the process-group scope used by both ring transports."""
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 0))
+    if local_world_size != world_size or int(os.environ.get("GROUP_RANK", 0)) != 0:
+        raise RuntimeError(
+            "SKIPPED: symmetric-memory ring requires one WORLD group on one node"
+        )
+    process_group_backend = str(dist.get_backend(dist.group.WORLD)).upper()
+    if process_group_backend != TRADITIONAL_RING_TRANSPORT_BACKEND:
+        raise RuntimeError(
+            "SKIPPED: symmetric-memory ring requires an NCCL process group"
+        )
+    return process_group_backend
+
+
+def setup_distributed():
+    """Initialize distributed environment for multi-GPU operation."""
+    setup_single_gpu_env("symmetric_memory_example", min_world_size=2)
+    if dist.is_initialized():
+        torch.cuda.set_device(resolve_local_rank())
+        return dist.get_rank(), dist.get_world_size()
+
+    # For single-node multi-GPU
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
+    local_rank = resolve_local_rank()
+
+    torch.cuda.set_device(local_rank)
+    # Use NCCL backend for GPU communication with timeout
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        world_size=world_size,
+        rank=rank,
+        timeout=torch.distributed.timedelta(seconds=30),  # 30 second timeout
+        device_id=local_rank,
+    )
+
+    return dist.get_rank(), dist.get_world_size()
+
+
+def detect_gb200_gb300() -> bool:
+    """Return whether the host CPU is NVIDIA Grace, as in GB200 and GB300 systems.
+
+    Grace identity comes from the NVIDIA SoC ID in sysfs. Arm core names in
+    /proc/cpuinfo cannot identify Grace, because other vendors ship the same
+    Neoverse cores. Whether a GPU reaches Grace over NVLink-C2C is a separate
+    question that _gpus_on_nvlink_c2c asks the CUDA driver.
+    """
+    return host_grace_soc_id() is not None
+
+
+def _gpus_on_nvlink_c2c(device_indexes) -> bool:
+    """Return whether the CUDA driver reports an NVLink-C2C host link for each listed GPU."""
+    indexes = list(device_indexes)
+    return bool(indexes) and all(
+        host_link_flags(torch.cuda.get_device_properties(index), index)[0] for index in indexes
+    )
+
+
+def enable_nvlink_c2c_optimizations() -> None:
+    """
+    Report GPU peer access and, on Grace superchips, the NVLink-C2C host link.
+
+    GB200 and GB300 attach each Blackwell GPU to a Grace CPU over NVLink-C2C,
+    with a 900 GB/s bidirectional spec peak. B200 and B300 GPUs in x86 servers
+    reach the host over PCIe. The NVLink-C2C lines print only when the host CPU
+    is Grace and the CUDA driver reports NVLink-C2C for every GPU.
+    """
+    if not torch.cuda.is_available():
+        return
+    
+    num_gpus = torch.cuda.device_count()
+    if num_gpus < 2:
+        return
+    
+    is_grace_blackwell = detect_gb200_gb300() and _gpus_on_nvlink_c2c(range(num_gpus))
+    
+    print("\n" + "=" * 80)
+    if is_grace_blackwell:
+        print("NVLink-C2C Configuration for GB200/GB300 Grace-Blackwell")
+    else:
+        print("GPU Peer Access Configuration for Blackwell (no NVLink-C2C host link reported)")
+    print("=" * 80)
+    
+    # 1. Enable peer access between all GPU pairs
+    for i in range(num_gpus):
+        torch.cuda.set_device(i)
+        for j in range(num_gpus):
+            if i != j:
+                try:
+                    # Check if peer access is possible
+                    can_access = torch.cuda.can_device_access_peer(i, j)
+                    if can_access:
+                        # This is automatically enabled in modern PyTorch
+                        # but we document it for educational purposes
+                        print(f"P2P access enabled: GPU {i} <-> GPU {j}")
+                except RuntimeError as e:
+                    print(f"✗ P2P access failed: GPU {i} <-> GPU {j}: {e}")
+    
+    # 2. Configure pinned memory for C2C transfers
+    # NVLink-C2C benefits from pinned memory allocation
+    torch.cuda.set_per_process_memory_fraction(0.9)  # Reserve 10% for overhead
+    
+    # 3. Set memory pool attributes (if using stream-ordered allocator)
+    # Note: This is configured via CUDA driver - no PyTorch API needed
+    
+    if is_grace_blackwell:
+        print("\nNVLink-C2C Features:")
+        print("  Grace CPU with an NVLink-C2C host link on every GPU:")
+        print("    - CPU-GPU: NVLink-C2C, 900 GB/s bidirectional spec peak (coherent, not measured here)")
+        print("    - GPU-GPU fabric and bandwidth require a separate topology probe")
+        print("    - Unified memory address space")
+        print("    - Grace CPU: 72 ARM cores")
+    else:
+        print("\nGPU Peer Access Features:")
+        print("  - Physical NVLink/NVSwitch fabric and bandwidth are not established here")
+
+    properties = [torch.cuda.get_device_properties(index) for index in range(num_gpus)]
+    print(f"\nDetected resources across {num_gpus} GPUs:")
+    print(f"  - Devices: {', '.join(props.name for props in properties)}")
+    print(f"  - Total SMs: {sum(props.multi_processor_count for props in properties)}")
+    print(f"  - Total memory: {sum(props.total_memory for props in properties) / 1e9:.2f} GB")
+    print("  - Aggregate bandwidth is not measured by this configuration check")
+    
+    print("=" * 80)
+
+
+def benchmark_traditional_p2p(tensor: torch.Tensor, peer_rank: int, iterations: int = 100):
+    """Benchmark traditional peer-to-peer copy using torch.cuda.comm."""
+    rank = dist.get_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
+    recv_tensor = torch.empty_like(tensor) if rank == peer_rank else None
+    
+    # Warmup
+    for _ in range(10):
+        if rank == 0:
+            dist.send(tensor, dst=peer_rank)
+        elif rank == peer_rank:
+            if recv_tensor is None:
+                raise RuntimeError("Receive buffer was not initialized")
+            dist.recv(recv_tensor, src=0)
+    
+    dist.barrier()
+    
+    # Benchmark
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    
+    torch.cuda.synchronize(device)
+    start.record()
+    
+    with nvtx.range(standardize_nvtx_label("transfer_sync:traditional_p2p")):
+        for _ in range(iterations):
+            if rank == 0:
+                dist.send(tensor, dst=peer_rank)
+            elif rank == peer_rank:
+                if recv_tensor is None:
+                    raise RuntimeError("Receive buffer was not initialized")
+                dist.recv(recv_tensor, src=0)
+    
+    end.record()
+    end.synchronize()
+    
+    return start.elapsed_time(end) / iterations
+
+
+def benchmark_symmetric_memory(tensor: torch.Tensor, iterations: int = 100):
+    """Benchmark symmetric memory for ultralow-latency cross-GPU access."""
+    rank = dist.get_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
+    remote_touch = torch.empty((), device=device, dtype=tensor.dtype) if rank == 1 else None
+    
+    # Check if symmetric memory is available
+    try:
+        # Allocate symmetric memory buffer
+        # All GPUs in the group can directly address this memory
+        with nvtx.range(standardize_nvtx_label("setup:symmetric_memory_allocation")):
+            sym_mem = maybe_create_symmetric_memory_handle(
+                tensor,
+                group=dist.group.WORLD,
+            )
+            if sym_mem is None:
+                raise RuntimeError("Symmetric memory not available")
+    except (AttributeError, RuntimeError) as e:
+        print(f"Rank {rank}: Symmetric memory not available: {e}")
+        print("This feature requires PyTorch 2.10+ with proper CUDA 13/NVSHMEM support")
+        return None
+    
+    dist.barrier()
+    
+    # Warmup - direct cross-GPU access
+    for _ in range(10):
+        if rank == 0:
+            # Rank 0 writes to its symmetric buffer
+            sym_mem.buffer[:] = tensor
+        dist.barrier()
+        if rank == 1:
+            # Rank 1 directly reads from rank 0's symmetric buffer
+            remote_data = sym_mem.get_buffer(0)
+            if remote_touch is None:
+                raise RuntimeError("Remote touch buffer was not initialized")
+            torch.sum(remote_data, dim=0, out=remote_touch)
+    
+    dist.barrier()
+    
+    # Benchmark
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    
+    torch.cuda.synchronize(device)
+    start.record()
+    
+    with nvtx.range(standardize_nvtx_label("transfer_sync:symmetric_memory_access")):
+        for _ in range(iterations):
+            if rank == 0:
+                sym_mem.buffer[:] = tensor
+            dist.barrier()
+            if rank == 1:
+                remote_data = sym_mem.get_buffer(0)
+                if remote_touch is None:
+                    raise RuntimeError("Remote touch buffer was not initialized")
+                torch.sum(remote_data, dim=0, out=remote_touch)
+    
+    end.record()
+    end.synchronize()
+    
+    return start.elapsed_time(end) / iterations
+
+
+def _ring_exchange(
+    send_tensor: torch.Tensor,
+    recv_tensor: torch.Tensor,
+    *,
+    next_rank: int,
+    previous_rank: int,
+) -> None:
+    """Post both ring directions before waiting for either operation."""
+    requests = dist.batch_isend_irecv(
+        [
+            dist.P2POp(dist.isend, send_tensor, next_rank),
+            dist.P2POp(dist.irecv, recv_tensor, previous_rank),
+        ]
+    )
+    for request in requests:
+        request.wait()
+
+
+def benchmark_traditional_ring(
+    tensor: torch.Tensor,
+    iterations: int = 100,
+    *,
+    return_output: bool = False,
+) -> float | tuple[float, torch.Tensor]:
+    """Benchmark ring send/recv using NCCL P2P ops across all ranks."""
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device("cuda", torch.cuda.current_device())
+    recv_tensor = torch.empty_like(tensor)
+    next_rank = (rank + 1) % world_size
+    prev_rank = (rank - 1) % world_size
+
+    for _ in range(5):
+        _ring_exchange(
+            tensor,
+            recv_tensor,
+            next_rank=next_rank,
+            previous_rank=prev_rank,
+        )
+    torch.cuda.synchronize(device)
+    dist.barrier()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    with nvtx_range(TRADITIONAL_RING_NVTX_RANGE, enable=True):
+        for _ in range(iterations):
+            _ring_exchange(
+                tensor,
+                recv_tensor,
+                next_rank=next_rank,
+                previous_rank=prev_rank,
+            )
+        end.record()
+        torch.cuda.synchronize(device)
+    dist.barrier()
+    time_ms = start.elapsed_time(end) / iterations
+    if return_output:
+        return time_ms, recv_tensor.detach().clone()
+    return time_ms
+
+
+def benchmark_symmetric_ring(
+    tensor: torch.Tensor,
+    iterations: int = 100,
+    *,
+    return_output: bool = False,
+    backend: SymmetricMemoryBackend = "NVSHMEM",
+) -> float | tuple[float, torch.Tensor]:
+    """Benchmark ring traffic through one explicit symmetric-memory backend."""
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device("cuda", torch.cuda.current_device())
+    requested_backend = backend.upper()
+    flat = tensor.flatten()
+    local = torch.stack([flat, flat.clone()])
+    handle = create_symmetric_memory_handle(
+        local,
+        group=dist.group.WORLD,
+        backend=backend,
+    )
+    if handle.backend != requested_backend:
+        raise RuntimeError(
+            "Symmetric ring backend identity mismatch: "
+            f"requested {requested_backend}, observed {handle.backend!r}"
+        )
+    # The constructor copies the seed tensor into a separate symmetric allocation.
+    # Peer writes target that allocation, so receives must read its local view.
+    local = handle.buffer
+    next_rank = (rank + 1) % world_size
+    next_buf = handle.get_buffer(next_rank)
+
+    if requested_backend == SYMMETRIC_RING_TRANSPORT_BACKEND:
+        for idx in range(5):
+            buf_idx = idx % 2
+            next_buf[buf_idx].copy_(flat, non_blocking=True)
+            # CUDA symmetric-memory barriers execute on this same current stream.
+            # The first distinct channel publishes every peer write.
+            handle.barrier(channel=0, timeout_ms=5000)
+            # The previous rank already wrote into this rank's symmetric slot.
+            # The second channel keeps that zero-copy receive slot alive until
+            # every rank has consumed the published generation.
+            handle.barrier(channel=1, timeout_ms=5000)
+
+        # Finish warmup before recording the complete steady-state iteration
+        # sequence. Capture records these operations; the timed replay executes it.
+        torch.cuda.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        capture_started = time.perf_counter()
+        with torch.cuda.graph(graph):
+            for idx in range(iterations):
+                buf_idx = idx % 2
+                next_buf[buf_idx].copy_(flat, non_blocking=True)
+                handle.barrier(channel=0, timeout_ms=5000)
+                handle.barrier(channel=1, timeout_ms=5000)
+        capture_wall_ms = (time.perf_counter() - capture_started) * 1000.0
+        print(
+            f"rank {rank} symmetric_ring_cuda_graph_capture_wall_ms: "
+            f"{capture_wall_ms:.6f}",
+            flush=True,
+        )
+    else:
+        # The NVSHMEM handle's barrier is a no-op in Torch 2.9.1. Retain the
+        # historical NCCL fences for callers that use this function's default.
+        recv_tensor = torch.empty_like(flat)
+        for idx in range(5):
+            buf_idx = idx % 2
+            next_buf[buf_idx].copy_(flat, non_blocking=True)
+            dist.barrier()
+            recv_tensor.copy_(local[buf_idx], non_blocking=True)
+            dist.barrier()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    with nvtx_range(SYMMETRIC_RING_NVTX_RANGE, enable=True):
+        if requested_backend == SYMMETRIC_RING_TRANSPORT_BACKEND:
+            graph.replay()
+        else:
+            for idx in range(iterations):
+                buf_idx = idx % 2
+                next_buf[buf_idx].copy_(flat, non_blocking=True)
+                dist.barrier()
+                recv_tensor.copy_(local[buf_idx], non_blocking=True)
+                dist.barrier()
+        end.record()
+        torch.cuda.synchronize(device)
+    time_ms = start.elapsed_time(end) / iterations
+    if return_output:
+        if requested_backend == SYMMETRIC_RING_TRANSPORT_BACKEND:
+            final_buf_idx = (iterations - 1) % 2
+            return time_ms, local[final_buf_idx].detach().clone()
+        return time_ms, recv_tensor.detach().clone()
+    return time_ms
+
+
+def benchmark_multigpu_symmetric_memory(
+    tensor_sizes: list | None = None,
+    iterations: int = 100
+) -> dict:
+    """
+    Benchmark symmetric memory patterns for multi-GPU B200 configurations.
+    
+    Tests:
+    - All-to-all communication (multi-GPU)
+    - Ring patterns (common in training)
+    - Broadcast from rank 0
+    
+    Returns:
+        Performance metrics
+    """
+    if tensor_sizes is None:
+        tensor_sizes = [(1024,), (1024 * 256,), (1024 * 1024,)]
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device("cuda", torch.cuda.current_device())
+    
+    if world_size < 2:
+        if rank == 0:
+            print(f"Warning: multi-GPU benchmark requested, got {world_size} GPUs")
+        return {}
+    
+    if rank == 0:
+        print("\n" + "=" * 80)
+        print(f"{world_size}x B200 Symmetric Memory Patterns")
+        print("=" * 80)
+    
+    results = {}
+    
+    for size in tensor_sizes:
+        tensor = torch.randn(size, device=device, dtype=torch.float32)
+        size_mb = size[0] * 4 / 1024 / 1024
+        
+        dist.barrier()
+        
+        # Test 1: Ring pattern (rank i -> rank (i+1) % world_size)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        
+        dest_rank = (rank + 1) % world_size
+        src_rank = (rank - 1) % world_size
+        recv_tensor = torch.empty_like(tensor)
+        
+        # Warmup
+        for _ in range(10):
+            _ring_exchange(
+                tensor,
+                recv_tensor,
+                next_rank=dest_rank,
+                previous_rank=src_rank,
+            )
+        
+        torch.cuda.synchronize(device)
+        start.record()
+        
+        for _ in range(iterations):
+            _ring_exchange(
+                tensor,
+                recv_tensor,
+                next_rank=dest_rank,
+                previous_rank=src_rank,
+            )
+        
+        end.record()
+        end.synchronize()
+        
+        ring_time = start.elapsed_time(end) / iterations
+        
+        # Test 2: Broadcast from rank 0
+        dist.barrier()
+        
+        start.record()
+        for _ in range(iterations):
+            dist.broadcast(tensor, src=0)
+        end.record()
+        end.synchronize()
+        
+        broadcast_time = start.elapsed_time(end) / iterations
+        
+        if rank == 0:
+            print(f"\nSize: {size_mb:.2f} MB")
+            print(f"  Ring (i->i+1):    {ring_time:.3f} ms")
+            print(f"  Broadcast (0->all): {broadcast_time:.3f} ms")
+            
+            # Estimate bandwidth
+            ring_bw = (size[0] * 4) / (ring_time / 1000) / 1e9
+            bcast_bw = (size[0] * 4 * (world_size - 1)) / (broadcast_time / 1000) / 1e9
+            print(f"  Ring bandwidth:     {ring_bw:.2f} GB/s")
+            print(f"  Broadcast bandwidth: {bcast_bw:.2f} GB/s")
+        
+        results[f"ring_{size_mb:.1f}MB"] = ring_time
+        results[f"broadcast_{size_mb:.1f}MB"] = broadcast_time
+    
+    if rank == 0:
+        print("=" * 80)
+    
+    return results
+
+
+def demonstrate_gb200_unified_memory() -> None:
+    """
+    Demonstrate GB200/GB300 unified memory features.
+    
+    GB200/GB300 provides:
+    - Coherent CPU-GPU address space
+    - NVLink-C2C between Grace and each GPU, 900 GB/s bidirectional spec peak
+    - Zero-copy CPU-GPU transfers
+
+    The demo runs only when the host CPU is Grace and the CUDA driver reports
+    NVLink-C2C for GPU 0, the GPU it copies to.
+    """
+    if not torch.cuda.is_available():
+        print("CUDA not available")
+        return
+    
+    is_grace = detect_gb200_gb300()
+    gpu0_on_c2c = is_grace and _gpus_on_nvlink_c2c([0])
+    
+    print("\n" + "=" * 80)
+    print("GB200/GB300 Unified Memory Demonstration")
+    print("=" * 80)
+    
+    if not gpu0_on_c2c:
+        if is_grace:
+            print("⚠ GPU 0 has no NVLink-C2C host link to the Grace CPU")
+        else:
+            print("⚠ Not running on an NVIDIA Grace CPU")
+        print("  This demo will show concepts that apply when Grace CPU is available")
+        print("=" * 80)
+        return
+    
+    print("NVIDIA Grace CPU with NVLink-C2C on GPU 0 detected")
+    print("\nKey Features:")
+    print("  1. Coherent CPU-GPU memory")
+    print(f"  2. NVLink-C2C: 900 GB/s bidirectional, {_C2C_PEAK_PER_DIRECTION_GBPS:.0f} GB/s per direction (spec peak)")
+    print("  3. Zero-copy data transfers")
+    print("  4. Optimal for CPU preprocessing + GPU compute")
+    
+    # Demonstrate pinned memory allocation (optimal for Grace-Blackwell)
+    size = 1024 * 1024 * 100  # 100M floats = 400MB
+    
+    print(f"\nAllocating {size * 4 / 1024 / 1024:.0f} MB of memory...")
+    
+    # CPU-pinned memory (optimal for CPU-GPU transfers on GB200/GB300)
+    cpu_tensor = torch.randn(size, dtype=torch.float32, pin_memory=True)
+    gpu_tensor = torch.empty(size, device='cuda:0', dtype=torch.float32)
+    
+    # Benchmark CPU->GPU transfer
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    
+    # Warmup
+    for _ in range(10):
+        gpu_tensor.copy_(cpu_tensor, non_blocking=True)
+    torch.cuda.synchronize()
+    
+    # Benchmark
+    start.record()
+    for _ in range(100):
+        gpu_tensor.copy_(cpu_tensor, non_blocking=True)
+    end.record()
+    end.synchronize()
+    
+    transfer_time = start.elapsed_time(end) / 100
+    bandwidth = (size * 4) / (transfer_time / 1000) / 1e9
+    
+    print(f"\nCPU→GPU Transfer:")
+    print(f"  Time: {transfer_time:.2f} ms")
+    print(f"  Bandwidth: {bandwidth:.2f} GB/s")
+    # This is a one-way copy, so it is compared with the per-direction peak.
+    print(f"  NVLink-C2C spec peak: {_C2C_PEAK_PER_DIRECTION_GBPS:.0f} GB/s per direction (not measured here)")
+    print(f"  Share of the per-direction peak: {(bandwidth / _C2C_PEAK_PER_DIRECTION_GBPS) * 100:.1f}%")
+    
+    print("\nUse Cases for GB200/GB300:")
+    print("  CPU data loading → Grace memory → GPU training")
+    print("  CPU preprocessing (tokenization) + GPU inference")
+    print("  Large batch prep on CPU, compute on GPU")
+    print("  Checkpoint to CPU memory (480GB-1TB)")
+    
+    print("=" * 80)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Symmetric memory example")
+    parser.add_argument(
+        "--benchmark-mode",
+        choices=("auto", "traditional", "symmetric"),
+        default="auto",
+        help="Benchmark mode: auto runs the original demo, or force a transport for perf runs.",
+    )
+    parser.add_argument(
+        "--tensor-bytes",
+        type=int,
+        default=4 * 1024,
+        help="Payload size in bytes for benchmark-only modes.",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=200,
+        help="Iterations per benchmark measurement.",
+    )
+    return parser.parse_args()
+
+
+def main() -> NVSHMEMWorkloadResult | None:
+    """Compare traditional P2P vs symmetric memory performance."""
+    args = _parse_args()
+    # Setup
+    rank, world_size = setup_distributed()
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    if args.benchmark_mode != "auto":
+        if world_size < 2:
+            if rank == 0:
+                print("Benchmark mode requires at least 2 GPUs.")
+            dist.destroy_process_group()
+            return
+        process_group_backend = _require_single_node_nccl_world(world_size)
+        input_generator = _make_rank_generator(device, rank=rank)
+        numel = max(1, args.tensor_bytes // 4)
+        tensor = torch.randn(
+            numel,
+            device=device,
+            dtype=torch.float32,
+            generator=input_generator,
+        ).add_(rank)
+        original_tensor = tensor.detach().clone()
+        if args.benchmark_mode == "traditional":
+            measured = benchmark_traditional_ring(
+                tensor,
+                iterations=args.iterations,
+                return_output=True,
+            )
+            label = "traditional_ring"
+            transport_backend = TRADITIONAL_RING_TRANSPORT_BACKEND
+        else:
+            measured = benchmark_symmetric_ring(
+                tensor,
+                iterations=args.iterations,
+                return_output=True,
+                backend=SYMMETRIC_RING_TRANSPORT_BACKEND,
+            )
+            label = "symmetric_ring"
+            transport_backend = SYMMETRIC_RING_TRANSPORT_BACKEND
+        if not isinstance(measured, tuple):
+            raise RuntimeError("Symmetric-memory ring measurement output is missing")
+        time_ms, verify_output = measured
+        rank_inputs = [torch.empty_like(original_tensor) for _ in range(world_size)]
+        dist.all_gather(rank_inputs, original_tensor)
+        reference_output = rank_inputs[(rank - 1) % world_size]
+        if rank == 0:
+            size_kb = args.tensor_bytes / 1024
+            print(f"{label}: size={size_kb:.2f} KB time={time_ms:.4f} ms/iter")
+        result = NVSHMEMWorkloadResult(
+            workload="symmetric-ring",
+            rank=rank,
+            world_size=world_size,
+            iterations=args.iterations,
+            time_per_iter_ms=time_ms,
+            configuration={
+                "benchmark_mode": args.benchmark_mode,
+                "tensor_bytes": args.tensor_bytes,
+                "iterations": args.iterations,
+                "process_group_backend": process_group_backend,
+                "requested_transport_backend": transport_backend,
+                "observed_transport_backend": transport_backend,
+            },
+            verify_inputs={"source_tensor": original_tensor},
+            verify_output=verify_output,
+            reference_output=reference_output,
+            batch_size=1,
+            parameter_count=0,
+            collective_type="ring_transfer",
+            output_tolerance=(1e-5, 1e-6),
+        )
+        dist.destroy_process_group()
+        return result
+
+    if world_size < 2:
+        if rank == 0:
+            print("This example requires at least 2 GPUs.")
+            print("Run with: torchrun --nproc_per_node <num_gpus> symmetric_memory_example.py")
+        return
+    
+    # Check for 4-GPU configuration
+    is_4gpu = world_size == 4
+    
+    # Create test tensor (small size to emphasize latency over bandwidth)
+    tensor_sizes = [
+        (1024,),           # 4 KB
+        (1024 * 256,),     # 1 MB
+        (1024 * 1024,),    # 4 MB
+    ]
+    
+    if rank == 0:
+        print("=" * 80)
+        print("PyTorch 2.10 Symmetric Memory Benchmark")
+        print(f"World size: {world_size} GPUs")
+        if is_4gpu:
+            print("4x B200 configuration detected")
+        print("=" * 80)
+    
+    # Run multi-GPU benchmarks when >=4 GPUs are available
+    if world_size >= 4:
+        benchmark_multigpu_symmetric_memory(tensor_sizes, iterations=100)
+    else:
+        # Standard 2-GPU benchmark
+        for size in tensor_sizes:
+            tensor = torch.randn(size, device=device, dtype=torch.float32)
+            
+            dist.barrier()
+            
+            # Benchmark traditional P2P
+            if rank == 0:
+                print(f"\nTensor size: {size[0] * 4 / 1024 / 1024:.2f} MB")
+            
+            trad_time = benchmark_traditional_p2p(tensor, peer_rank=1, iterations=100)
+            
+            dist.barrier()
+            
+            # Benchmark symmetric memory
+            sym_time = benchmark_symmetric_memory(tensor, iterations=100)
+            
+            if rank == 0:
+                print(f"  Traditional P2P:     {trad_time:.3f} ms/iter")
+                if sym_time is not None:
+                    print(f"  Symmetric Memory:    {sym_time:.3f} ms/iter")
+                    speedup = trad_time / sym_time
+                    print(f"  Speedup:             {speedup:.2f}x")
+                else:
+                    print(f"  Symmetric Memory:    Not available")
+    
+    if rank == 0:
+        print("\n" + "=" * 80)
+        print("Key Takeaways:")
+        print("- Symmetric memory bypasses CPU involvement for small transfers")
+        print("- Prefer it when latency matters more than bandwidth")
+        print("- Ideal for frequent small synchronization points in multi-GPU algorithms")
+        if is_4gpu:
+            print("- 4x B200: Optimal for ring/tree algorithms with symmetric memory")
+        print("=" * 80)
+    
+    # Demonstrate GB200/GB300 features (rank 0 only for simplicity)
+    if rank == 0:
+        demonstrate_gb200_unified_memory()
+    
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_main_with_skip_status(main))

@@ -1,0 +1,768 @@
+# B200 autoresearch handoff
+
+Updated: 2026-08-31
+
+## Goal
+
+Apply the evidence discipline from [Sankalp's autoresearch writeup](https://sankalp.bearblog.dev/autoresearch/) and [Mike's QR v2 writeup](https://ml-mike.com/writing/qr_v2/) to this repository. Validate every discovered benchmark target on the remote B200 host. Keep correctness, provenance, per-case regression limits, and promotion evidence bound to each result.
+
+The commit that contains this file is the authoritative checkpoint. Run `git rev-parse HEAD` after checkout and record that commit in every validation artifact.
+
+## GPU yield rule
+
+If another task asks for the GPUs, stop this sweep at the next safe target boundary.
+
+1. Stop the active orchestrator and wait for its child benchmark or profiler process to exit.
+2. Do not kill unrelated jobs.
+3. Run the normalized status command below.
+4. Record the active target, completed targets, and remaining targets in this file.
+5. Commit the updated handoff and source changes.
+6. Push the work branch.
+7. Merge it into `main`.
+8. Push `main` and verify both remote branch tips.
+9. Yield the GPUs.
+
+Run with `--no-auto-resume`. This prevents a stopped sweep from restarting while another task owns the GPUs.
+
+## Current resume point
+
+GPU ownership was yielded on 2026-08-16. Another task owns both B200 GPUs. Do not launch, resume, profile, or isolate a GPU target until that task finishes and GPU ownership is returned.
+
+The paused run ID is `20260816_autoresearch_b200_full_13de588b7`. Its orchestrator is not live. No benchmark or profiler child from this run remains. Keep this package as historical evidence. Do not resume it after installing the next checkpoint. The new resume contract requires the stored clean commit and execution provenance to match the current checkout, so a resumed run cannot combine measurements from two source revisions.
+
+### Audit remediation pickup (2026-08-31)
+
+B200 custody is unavailable for the active two-wave audit remediation goal. No GPU, SSH, runner, profiler, sanitizer, or device probe was used during the latest reconciliation. A later session may continue only after explicit custody returns and after re-reading this ownership section.
+
+The final code source epoch is `3316e0efe985040745ffd926c5f76a6bd4436aff`; later mainline commits through the commit containing this handoff change CI, documentation, and retained evidence only. Current audit state:
+
+- all 128 Wave 1 and 141 Wave 2 rows have source dispositions;
+- the 76-row Wave 1 local runtime matrix is 7 verified and 69 pending;
+- all 48 Wave 2 runtime rows have exact final-source hosted CPU regressions, but all 48 remain `awaiting_runtime`;
+- retained CUDA 13 run `33391774950` supplies bounded four-target compiler evidence for 17 pending Wave 1 rows and 9 Wave 2 rows, plus a partial `W2-078` header result;
+- retained hosted CPU run `33391774956` records 4,346 passed, 461 explicit skips, and zero failures/errors; and
+- the full 90-specification/327-package Linux/CUDA dependency install, target numerical/device gates, CUDA/NCCL, sanitizers, profilers, Grace/NVML cells, and performance remain pending where the ledger specifies them.
+
+Use [the runtime handoff](docs/audits/2026-08-30/evidence/integration/runtime-handoff.md), [current status](docs/audits/2026-08-30/STATUS.md), and [ledger](docs/audits/2026-08-30/remediation-ledger.json) as the pickup records. Do not restart the old 486-target sweep to satisfy these findings. Run the smallest affected target matrix. Do not rerun the full CPU suite merely to reproduce retained evidence; only a later source or dependency change that invalidates it should require a new broad pass.
+
+### Historical autoresearch non-B200 checkpoint
+
+This subsection preserves the older 486-target autoresearch campaign. It does
+not supersede the focused two-wave audit-remediation pickup above.
+
+Source checkpoint `f7ec105e05941c6c6a58e9f064e1ffe041dd00af` is published to both `main` and `codex/actions-node24-ci-20260816`. No B200 command, SSH probe, benchmark, profiler, workflow, or runner was used while preparing or validating it.
+
+- [Benchmark Validation run 32093636361](https://github.com/cfregly/ai-performance-engineering/actions/runs/32093636361) passed in 3 minutes 37 seconds. Contract tests, dashboard tests and build, Ruff, mypy, shell checks, the silent-fallback audit, and all 932 benchmark contracts passed.
+- [Dual-Architecture Compare run 32093636344](https://github.com/cfregly/ai-performance-engineering/actions/runs/32093636344) passed in 33 minutes 9 seconds. It completed `sm_100`, `sm_103`, `sm_120`, and `sm_121`. Each architecture compiled the normal and verification forms of `tma_multicast_baseline` and `tma_multicast_cluster`.
+- The broad macOS CPU suite passed 2,453 tests, skipped 516 capability-limited tests, and failed 0 tests in 264.57 seconds. Six Triton-only test files were excluded because Triton has no macOS ARM wheel.
+- The changed-file gate passed 110 tests and skipped 2 Linux-only tests. Pinned Ruff, Python syntax checks, four-architecture Make dry runs, workflow YAML parsing, the silent-fallback audit, and `git diff --check` passed.
+
+The Chapter 10 fix keeps the 2 KiB A tile in static shared memory and moves the 64 KiB B tile into aligned opt-in dynamic shared memory. Runtime checks include the remaining static allocation before launch. SM120 and SM121 now report a truthful exit-code-3 skip for both sides of the unsupported multicast comparison. The direct demo preserves the `SKIPPED:` reason without a traceback. CPU validation also handles macOS pinned staging, synthetic Linux fixtures, resolved temporary paths, and hard environment errors without false portable-mode recovery advice.
+
+Tier 1 completed all six targets before the pause. Four succeeded. Two exposed defects:
+
+- `labs/block_scaling:block_scaling` failed because the CUTLASS 4.1 example called `cute.make_fragment`, which the pinned CUTLASS DSL 4.5.2 runtime replaced with `cute.make_rmem_tensor`. The baseline completed at 0.117482032 ms and all baseline profilers succeeded. The local compatibility fix and CPU regression tests are complete. B200 verification remains.
+- `labs/flashattention4:flashattention4_alibi` passed input and output verification, but measured 3.429079 ms for the baseline and 3.572818 ms for the optimized path. The 0.959769x result did not meet the 1.05x speed gate. Both variants produced Nsight Systems, Nsight Compute, and PyTorch profiles. The local fix now measures all correct compiled providers for Flex-only auto modes instead of accepting the first valid provider. B200 verification remains.
+
+The other tier 1 targets succeeded: `labs/persistent_decode:persistent_decode`, `labs/kv_optimization:kv_standard`, `ch04:gradient_fusion`, and `labs/real_world_models:llama_3_1_8b`.
+
+The full sweep then stopped before its first target. Batch preflight treated missing optional Phi-3.5-MoE model and TensorRT-LLM engine files as a global failure. The local fix now preserves direct single-target asset checks, defers optional asset checks in mixed batches to the target's existing truthful `SKIPPED` path, and returns structured preflight failures when callers disable process exit.
+
+The strict 486-target full sweep has not run any target. No target is partially complete. All 486 discovered targets remain. After GPU ownership returns, install the published checkpoint in a clean worktree and start a new run ID with `--no-auto-resume`. Do not carry completion credit from the paused package. Tier 1 and the full sweep must both run on the same published commit.
+
+The dry-run inventory contains 464 single-GPU lane targets and 22 two-GPU lane targets. Some target names contain `multigpu` but remain in the single-GPU lane because their benchmark contract explicitly supports one visible GPU. The lane recorded below is authoritative.
+
+A CPU-hidden full test run at public commit `50dd8b2a13c0e01b5840c18ebfae855e3a004ee1` completed before the latest focused fixes:
+
+- 2,703 passed
+- 516 skipped
+- 5 failed
+- 41 percent line coverage
+
+The five failures exposed two deterministic MCP fixture defects and three order-dependent subprocess failures. A clean first-failure probe then identified the exact remaining order defect. A repository hygiene test left `LD_PRELOAD` pointing at a deleted fake NCCL library. The dynamic loader warning replaced the expected CUDA benchmark skip reason.
+
+Post-run fixes now use isolated MCP fixture data, prevent generic cluster promotion from changing tracked files, run the generic fabric tool in readiness-only mode, report truthful readiness-only progress, defer chapter 18 vLLM environment setup until benchmark setup, and restore `LD_PRELOAD` after the explicit system-policy test. The clean complete rerun is recorded below.
+
+The clean CPU-hidden rerun at source commit `9a1e5dbd21d16e5f7f90140109f18ce96b91a2ec` is complete:
+
+- 2,715 passed
+- 516 skipped by explicit capability gates
+- 0 failed
+- 12 warnings
+- 41.17025313025096 percent line coverage
+- 30,382 covered lines out of 73,796 statements
+- 426.56 seconds
+
+The remote worktree stayed tracked-clean. All three submodules matched their recorded commits. No GPU process ran during this gate.
+
+The published checkpoint `8fcd714c6d3b6b04f1b1ee1ddf601d8540cadcb5` then exposed two CI-only defects. The dual-architecture CUDA container did not include Git before checkout, so recursive submodule checkout could not start. The verification auditor also redirected process file descriptors, which the blocking silent-fallback audit correctly rejected. The next checkpoint installs Git before checkout and captures Python output with scoped stream redirection.
+
+The same checkpoint adds `B006` and `B023` to the repository-wide first-party Ruff gate. Mutable defaults and deferred loop callbacks are now blocking in local `make lint` and GitHub Actions. The local fixes bind benchmark operands at callback creation, construct the symmetric-memory default inside each call, and bind delayed request completion data before starting its timer.
+
+GitHub Benchmark Validation passed all three jobs for commit `546c3ef8400b3ade687e72f8719bd56c9359cc00`. The dual-architecture job passed container setup, prerequisite installation, recursive checkout, CUTLASS installation, and CUDA architecture validation. It then exposed a second path defect. The compare script resolved its root as `code/core` and looked for `code/core/ch01`. The next checkpoint resolves `code` itself and includes an executable stub-`make` regression for all ten configured chapter directories.
+
+Commit `17dcc59b67910b7f5aedb4726f57ee8e5ecd59eb` fixes that path defect. Its dual-architecture run compiled Chapter 1 and Chapter 2 for `sm_100`, `sm_103`, `sm_120`, and `sm_121`. Chapter 4 then failed because five educational NVSHMEM builds called `NVTX_RANGE` while their NVTX helper include was guarded by `USE_NVSHMEM`. The next checkpoint makes the helper available in both the NVSHMEM and educational build paths.
+
+Commit `ec5af42d73257d6df68e8cabe70ff1076fdaf7c8` fixes the Chapter 4 NVTX include contract. GitHub Benchmark Validation passed all three jobs for that commit. Its duplicated branch and main dual-architecture runs each reached the 45 minute job limit. The branch log completed Chapters 1, 2, 4, 6, 7, and 8 for all four configured architectures. It also completed Chapter 9 for `sm_100`, `sm_103`, and `sm_120`. The job was compiling the `sm_121` Chapter 9 targets when GitHub canceled it at 45 minutes and 3 seconds. No compiler error appeared before cancellation.
+
+The next checkpoint removes that throughput bottleneck and closes two evidence gaps. It runs two independent compiler jobs at a time while keeping chapters and architectures sequential. It changes the compare set from 652 to 648 compile and link commands by excluding four PyTorch extension translation units, restoring the Chapter 10 Blackwell standalone program, and restoring both omitted Chapter 11 driver programs. A source-based contract now requires every standalone CUDA source with a real `main` to appear in the dry build. Every chapter compare loop stops after any architecture failure. Clean targets cover every configured architecture, so a repeated compare cannot accept a stale binary. The workflow also skips unused submodules, combines package installation, and checks the emitted `sm_100a` and `sm_103a` codes.
+
+All active root actions now use their Node 24 compatible version 7 releases. The dual workflow runs automatically only on pushes to `main` or `develop` and on pull requests targeting those branches. This avoids duplicate direct feature-branch builds.
+
+Tier 1 now requires the fixed `["self-hosted","linux","x64","gpu","b200","node24-actions"]` labels. Apply `node24-actions` only after confirming runner version 2.327.1 or newer. Apply `b200` only after confirming that every visible GPU reports the exact name `NVIDIA B200` and has MIG disabled. The workflow checks both fields again before it records canonical history. It computes the run id before repository setup, uses Bash pipe failure handling for the benchmark command, and skips artifact upload when the benchmark step never starts. GitHub currently reports zero registered self-hosted runners for this repository. Tier 1 will remain queued until an eligible runner is registered and labeled. This fail-closed state is intentional. Register and attest the runner before operational signoff or any Tier 1 dispatch.
+
+The `tier1-canonical-acceptance` GitHub environment is configured with a required reviewer and a custom deployment policy that permits only `main`. The environment gate runs after the candidate evidence upload. The recorded requester identifies who started the dispatch, not who approved the environment deployment.
+
+After runner attestation, start canonical history with one manual `main` branch dispatch that sets `bootstrap_history` and `accept_history_anchor` to `true` and supplies a nonblank `acceptance_note`. The B200 job uploads candidate history and raw evidence first. The protected `tier1-canonical-acceptance` environment then gates post-benchmark promotion. Later runs leave `bootstrap_history` false. They restore cumulative history and verify the retained evidence for its latest eligible baseline before benchmark setup. Normal evidence publication and reviewed promotion share a short publication lock. Each publication restores the newest canonical state after the benchmark has finished, so a long producer cannot replace a newer reviewed anchor with stale history. Each concurrency group retains at most 100 pending jobs, and GitHub does not guarantee strict dispatch order. A failed, skipped, incomplete, or target-deleting run remains recorded but cannot replace the accepted anchor. Normal publication also keeps a confirmed regression ineligible. A confirmed regression may replace the anchor only through the protected `accept_history_anchor` path with a requester, public override reason, exact Actions workflow run URL, immutable evidence, and environment approval. The accepted entry records the public note as the override reason. A regression cleared only by a recheck remains rejected. Candidate, evidence, and history artifacts have 90 day retention. Restore fails closed on archive integrity, incomplete discovery, and workflow, branch, commit, repository, or digest provenance mismatch. Structural fallback is limited to packages from a workflow run that GitHub proves did not succeed.
+
+Renew the accepted anchor before its evidence reaches 60 days old by running the same reviewed manual acceptance path with a new complete evidence-bound candidate. Normal restore stops at that boundary. If the old evidence reaches the 90 day hard expiry, use an audited bootstrap recovery instead of bypassing the provenance gate.
+
+## Completed validation
+
+- Repository benchmark audit checked 932 files with 0 errors and 0 warnings.
+- The integrated post-fix CPU-safe regression set passed 144 tests and skipped 26 capability-limited tests.
+- Focused campaign, evidence, queue, promotion, dashboard, setup, benchmark, and generated-code boundary tests passed in their owned batches.
+- Dashboard dependency audit reported 0 findings. Lint, component tests, and production build passed.
+- Root workflow YAML parsed. All workflow run blocks and setup shell scripts passed syntax checks.
+- `make lint` passed when Make used the configured Python interpreter.
+- Chapter 8 and Chapter 10 tcgen05 source audits checked 80 files with 0 errors and 0 warnings.
+- The complete MCP catalog passed 157 tests with GPUs hidden. Every generic tool call now checks that tracked Git state is unchanged.
+- The latest integrated cluster, progress, environment, chapter 18 import-isolation, CUDA wrapper, and profiler set passed 35 tests with GPUs hidden.
+- The exact leaking environment-test plus CUDA-wrapper order passed 2 tests after the fix.
+- The repository benchmark audit still checks 932 files with 0 errors and 0 warnings after the latest changes.
+- The complete CPU-hidden B200 suite passed 2,715 tests, skipped 516 capability-limited tests, and failed 0 tests. Coverage was 41.17025313025096 percent.
+- B200 Chapter 9 FP8 CUTLASS baseline, optimized, and verification builds compiled for SM100a. Verification checksums matched.
+- B200 Chapter 19 focused GPU tests passed.
+- One Chapter 9 timing probe was observed. It is not enough evidence for a performance claim.
+- The paused strict tier 1 run completed 6 targets with 4 successes and 2 diagnosed failures. The full sweep did not start a target.
+- The CUTLASS block-scaling compatibility tests pass 3 CPU-only cases.
+- The mixed-batch preflight regression passes locally and proves that direct asset checks remain strict while batch execution can record target-level skips.
+- A local strict dry run still discovers exactly 486 targets, split into 464 one-GPU targets and 22 two-GPU targets.
+- The resume regression proves that full-sweep asset policy stays nonblocking even when the optional TensorRT target is the only remaining unit.
+- The FlashAttention provider-selection regression passes locally. The full focused readiness set passes 80 tests with GPUs hidden.
+- The repository-wide first-party Ruff correctness gate passes for syntax errors, invalid control flow, and undefined names. Vendored `third_party` code is excluded. Deliberate negative-test fixtures carry inline exceptions.
+- The latest CPU-only first-party regression set passes 156 tests and skips 2 Linux-only torchrun cases on macOS. The source-inspection fixture set passes another 25 tests.
+- The benchmark coverage CLI now scans the repository root, records the matched metric helper, and reports 354 baseline or optimized files across 11 populated chapters and 46 labs.
+- The repository benchmark audit still checks 932 files with 0 errors and 0 warnings after these correctness fixes.
+- The latest local focused set passes 99 tests for repository configuration, verification loading, silent fallbacks, warning filters, deferred callbacks, FlashAttention provider selection, end-to-end sweep state, and Chapter 10 backend selection.
+- The expanded repository-wide Ruff gate passes `E9`, `F63`, `F7`, `F82`, `B006`, and `B023`.
+- The blocking silent-fallback audit reports 0 findings in its CI categories.
+- Literal `make lint` passes in a clean Python 3.12 environment with Ruff 0.8.4, mypy 1.18.2, and NumPy 2.1.2.
+- No B200 command, SSH probe, benchmark, or profiler ran while preparing this checkpoint.
+- GitHub Benchmark Validation passes its contract, dashboard, and static-analysis jobs at commit `546c3ef8400b3ade687e72f8719bd56c9359cc00`.
+- The dual-architecture compare-script root regression passes 17 repository-configuration tests locally. Its GitHub Actions rerun remains required after publication.
+- GitHub Benchmark Validation also passes all three jobs at commit `17dcc59b67910b7f5aedb4726f57ee8e5ecd59eb`.
+- The Chapter 4 NVSHMEM include contract and repository-configuration set passes 22 local tests. The strict Chapter 4 benchmark audit checks 107 files with 0 errors and 0 warnings.
+- GitHub Benchmark Validation passes all three jobs at commit `ec5af42d73257d6df68e8cabe70ff1076fdaf7c8`.
+- The measured sequential dual build completed six whole chapters across four architectures and three of four Chapter 9 architectures before the exact 45 minute timeout. No compiler error preceded cancellation.
+- The latest local workflow, Tier 1 history, end-to-end outcome, cluster manifest, dashboard history, Make contract, and Chapter 10 standalone set passes 367 CPU-hidden tests.
+- Forty chapter and architecture Make dry runs pass for `sm_100`, `sm_103`, `sm_120`, and `sm_121`.
+- Literal `make lint` passes in Python 3.12.13 with Ruff 0.8.4, mypy 1.18.2, and NumPy 2.1.2. It checks 932 benchmark files with 0 errors and 0 warnings.
+- The Node 24 action metadata check covers every root `.yml` and `.yaml` workflow. The fixed Tier 1 labels and exact B200 preflight prevent an unverified or different self-hosted runner from recording canonical history.
+- No B200 command, SSH probe, benchmark, or profiler ran during this CI checkpoint.
+
+## Environment contract
+
+Use environment variables or local shell aliases for transport details. Do not commit hostnames, private paths, keys, tokens, or remote instance identifiers.
+
+Required placeholders:
+
+- `$B200_JUMP`: jump host
+- `$B200_HOST`: B200 host reached through the jump host
+- `$B200_CANDIDATE_WORKTREE`: candidate checkout
+- `$B200_PYTHON`: validated Python interpreter
+- `$RUN_ID`: stable run identifier
+
+The validated hardware contract is two NVIDIA B200 GPUs with CUDA 13, PyTorch with CUDA 13 support, Triton, Nsight Systems, and Nsight Compute. The host has NVLink between both GPUs. RDMA was not visible, so fabric results may be truthful partial results.
+
+## Preflight after checkout
+
+For the unchanged `3316e0efe` code epoch, verify the retained receipts and run the finding-specific focused selectors from the runtime handoff. Do not repeat the full CPU pass solely as ritual preflight. If a later code or dependency change invalidates the retained hosted run, use this broader preflight once for the new epoch:
+
+```bash
+git status --short
+git submodule status --recursive
+"$B200_PYTHON" -m core.scripts.linting.check_benchmarks --include-unpaired --fail-on-warnings
+make lint
+CUDA_VISIBLE_DEVICES= COVERAGE_FILE=/tmp/aiperf-coverage \
+  "$B200_PYTHON" -m pytest tests/ -v --tb=short -p no:cacheprovider \
+  --cov=core --cov-report=term-missing
+```
+
+Do not continue to GPU timing if the applicable focused or invalidation-triggered broad collection fails. Fix collection, then rerun only the affected verification unless the broad epoch itself was invalidated.
+
+## Strict sweep command
+
+Run the command inside `$B200_CANDIDATE_WORKTREE/code`.
+
+```bash
+"$B200_PYTHON" -m cli.aisp bench run-e2e \
+  --run-id "$RUN_ID" \
+  --run-full-sweep \
+  --run-fabric \
+  --cluster-preset common-answer-fast \
+  --validity-profile strict \
+  --profile minimal \
+  --iterations 5 \
+  --warmup 1 \
+  --no-auto-resume
+```
+
+Do not set GPU clocks outside the harness. Run one benchmark or profiler owner at a time.
+
+## Status and pause capture
+
+```bash
+"$B200_PYTHON" -m cli.aisp bench run-e2e-status --run-id "$RUN_ID"
+```
+
+The normalized status is the preferred source. Capture these run files before yielding:
+
+- `artifacts/e2e_runs/$RUN_ID/manifest.json`
+- `artifacts/e2e_runs/$RUN_ID/progress.json`
+- `artifacts/e2e_runs/$RUN_ID/checkpoint.json`
+- `artifacts/e2e_runs/$RUN_ID/target_inventory.json`
+- `artifacts/e2e_runs/$RUN_ID/events.jsonl`
+- `artifacts/e2e_runs/$RUN_ID/summary.json`
+- `artifacts/e2e_runs/$RUN_ID/summary.md`
+
+Generated run artifacts remain ignored by Git. Record their hashes and terminal status in the campaign ledger or this handoff. Do not force-add raw profiler output or generated binaries.
+
+## New-run command after this checkpoint
+
+Choose a new `$RUN_ID` after reviewing the historical paused package and confirming no other task owns the GPUs. Run from the clean published checkpoint.
+
+```bash
+"$B200_PYTHON" -m cli.aisp bench run-e2e \
+  --run-id "$RUN_ID" \
+  --run-full-sweep \
+  --run-fabric \
+  --cluster-preset common-answer-fast \
+  --validity-profile strict \
+  --profile minimal \
+  --iterations 5 \
+  --warmup 1 \
+  --no-auto-resume
+```
+
+## Historical 486-target autoresearch validation phases
+
+The phases below belong to the separate autoresearch campaign described at the
+top of this file. They are not the acceptance queue for the active two-wave
+audit-remediation goal. For that goal, follow the focused runtime handoff and do
+not rerun the full CPU suite or the 486-target sweep merely to reproduce retained
+evidence. A later source or dependency change that invalidates the retained
+evidence, or a separately authorized autoresearch run, is required before those
+broad reruns are appropriate.
+
+1. Keep all B200 GPU work stopped until the other task releases both GPUs.
+2. Keep source checkpoint `f7ec105e05941c6c6a58e9f064e1ffe041dd00af` as the verified non-B200 source while the GPUs remain occupied.
+3. Continue only CPU-safe regression, audit, lint, and coverage work while the GPUs remain occupied.
+4. Register and attest one eligible Tier 1 runner. If no compatible canonical history exists, make one manual `main` dispatch with `bootstrap_history` and `accept_history_anchor` set to `true`, plus a public `acceptance_note`.
+5. Finish the FlashAttention ALiBi contract investigation with the saved tier 1 profiler evidence.
+6. Install the published checkpoint on the B200 worktree after GPU ownership returns.
+7. Rerun the full CPU-hidden pytest suite with coverage before GPU timing.
+8. Start a new run ID with the strict command above and `--no-auto-resume`.
+9. Verify the block-scaling CUTLASS fix on B200 and rerun the corrected attention target.
+10. Run the strict 486-target sweep.
+11. Run the two-GPU lane only when both GPUs are free.
+12. Record honest `passed`, `failed`, `skipped`, or `partial` status for every target.
+13. Compare candidate and control on representative Chapter 9 and Chapter 19 cases with repeated trials.
+14. Audit manifests, hashes, environment evidence, profiler evidence, and no-regression gates.
+15. Update this handoff with the exact completed and remaining target sets.
+16. Commit, push, merge to `main`, push `main`, and verify remote tips.
+
+"100 percent coverage" means every discovered target has a terminal status and every reachable code path has measured coverage. It does not permit turning unsupported hardware or missing fabric into a false pass.
+
+## Complete unrun target inventory
+
+This list came from the strict remote dry run on 2026-08-16. Every listed target remains unrun in the full sweep.
+
+```text
+ch01:gemm [1 GPU lane]
+ch01:gemm_batched [1 GPU lane]
+ch01:gemm_strided [1 GPU lane]
+ch01:nvfp4_mlp [1 GPU lane]
+ch01:performance [1 GPU lane]
+ch01:performance_fp16 [1 GPU lane]
+ch01:performance_fusion [1 GPU lane]
+ch02:cublas [1 GPU lane]
+ch02:grace_coherent_memory [1 GPU lane]
+ch02:memory_transfer [1 GPU lane]
+ch03:double_buffered_batch_provisioning [1 GPU lane]
+ch03:gemm [1 GPU lane]
+ch03:pageable_copy [1 GPU lane]
+ch03:pinned_prefetch_mlp [1 GPU lane]
+ch03:rack_prep [1 GPU lane]
+ch04:bandwidth_benchmark_suite [1 GPU lane]
+ch04:bandwidth_benchmark_suite_multigpu [1 GPU lane]
+ch04:continuous_batching [1 GPU lane]
+ch04:continuous_batching_multigpu [1 GPU lane]
+ch04:cpu_reduction [1 GPU lane]
+ch04:dataparallel [1 GPU lane]
+ch04:dataparallel_multigpu [1 GPU lane]
+ch04:disaggregated [1 GPU lane]
+ch04:disaggregated_multigpu [1 GPU lane]
+ch04:grace_blackwell_locality [1 GPU lane]
+ch04:gradient_compression_fp16 [1 GPU lane]
+ch04:gradient_compression_fp16_comm_only [1 GPU lane]
+ch04:gradient_compression_fp16_comm_only_multigpu [1 GPU lane]
+ch04:gradient_compression_fp16_multigpu [1 GPU lane]
+ch04:gradient_compression_int8 [1 GPU lane]
+ch04:gradient_compression_int8_comm_only [1 GPU lane]
+ch04:gradient_compression_int8_comm_only_multigpu [1 GPU lane]
+ch04:gradient_compression_int8_multigpu [1 GPU lane]
+ch04:gradient_fusion [1 GPU lane]
+ch04:nccl [1 GPU lane]
+ch04:nixl_tier_handoff [1 GPU lane]
+ch04:no_overlap [1 GPU lane]
+ch04:nvlink_multigpu [1 GPU lane]
+ch04:nvlink_topology_aware [1 GPU lane]
+ch04:nvlink_topology_aware_multigpu [1 GPU lane]
+ch04:nvshmem_ibgda_microbench [1 GPU lane]
+ch04:nvshmem_ibgda_microbench_multigpu [1 GPU lane]
+ch04:nvshmem_pipeline_parallel [1 GPU lane]
+ch04:nvshmem_training_example [1 GPU lane]
+ch04:nvshmem_training_patterns [1 GPU lane]
+ch04:nvshmem_vs_nccl_benchmark [1 GPU lane]
+ch04:pcie_staging [1 GPU lane]
+ch04:reinit_comm [1 GPU lane]
+ch04:reinit_comm_multigpu [1 GPU lane]
+ch04:symmetric_memory [1 GPU lane]
+ch04:symmetric_memory_perf [1 GPU lane]
+ch05:ai [1 GPU lane]
+ch05:decompression [1 GPU lane]
+ch05:distributed_multigpu [1 GPU lane]
+ch05:host_staged_reduction [1 GPU lane]
+ch05:storage_cpu [1 GPU lane]
+ch05:vectorization [1 GPU lane]
+ch06:adaptive [1 GPU lane]
+ch06:add [1 GPU lane]
+ch06:add_cuda [1 GPU lane]
+ch06:attention_ilp [1 GPU lane]
+ch06:autotuning [1 GPU lane]
+ch06:bank_conflicts [1 GPU lane]
+ch06:elementwise_ilp [1 GPU lane]
+ch06:launch_bounds [1 GPU lane]
+ch06:launch_bounds_cuda [1 GPU lane]
+ch06:quantization_ilp [1 GPU lane]
+ch06:warp_divergence_ilp [1 GPU lane]
+ch07:async_prefetch [1 GPU lane]
+ch07:copy_scalar [1 GPU lane]
+ch07:copy_scalar_vectorized [1 GPU lane]
+ch07:copy_uncoalesced [1 GPU lane]
+ch07:copy_uncoalesced_coalesced [1 GPU lane]
+ch07:float4_vector [1 GPU lane]
+ch07:hbm_copy [1 GPU lane]
+ch07:hbm_peak [1 GPU lane]
+ch07:lookup [1 GPU lane]
+ch07:matmul [1 GPU lane]
+ch07:matmul_tiled [1 GPU lane]
+ch07:memory_access [1 GPU lane]
+ch07:tma_bulk_tensor_2d [1 GPU lane]
+ch07:tma_copy [1 GPU lane]
+ch07:transpose [1 GPU lane]
+ch07:transpose_padded [1 GPU lane]
+ch08:ai_optimization [1 GPU lane]
+ch08:hbm [1 GPU lane]
+ch08:hbm_cuda [1 GPU lane]
+ch08:hbm_cuda_vectorized [1 GPU lane]
+ch08:loop_unrolling [1 GPU lane]
+ch08:nvfp4_mlp [1 GPU lane]
+ch08:occupancy_tuning [1 GPU lane]
+ch08:tcgen05_custom_vs_cublas [1 GPU lane]
+ch08:threshold [1 GPU lane]
+ch08:thresholdtma [1 GPU lane]
+ch08:tiling [1 GPU lane]
+ch08:tiling_tcgen05 [1 GPU lane]
+ch09:compute_bound [1 GPU lane]
+ch09:cublas_gemm_fp4_perchannel [1 GPU lane]
+ch09:cublaslt_gemm [1 GPU lane]
+ch09:cublaslt_gemm_fp16 [1 GPU lane]
+ch09:cublaslt_gemm_fp4 [1 GPU lane]
+ch09:cublaslt_gemm_fp8 [1 GPU lane]
+ch09:cute_dsl_nvfp4_gemm [1 GPU lane]
+ch09:cutlass_gemm [1 GPU lane]
+ch09:cutlass_gemm_fp16 [1 GPU lane]
+ch09:cutlass_gemm_fp4 [1 GPU lane]
+ch09:cutlass_gemm_fp4_all_concepts [1 GPU lane]
+ch09:cutlass_gemm_fp4_perchannel [1 GPU lane]
+ch09:cutlass_gemm_fp8 [1 GPU lane]
+ch09:fused_l2norm [1 GPU lane]
+ch09:memory_bound [1 GPU lane]
+ch09:micro_tiling_matmul [1 GPU lane]
+ch09:sdpa_attention [1 GPU lane]
+ch09:tcgen05_tma_pipeline [1 GPU lane]
+ch09:triton [1 GPU lane]
+ch10:atomic_reduction [1 GPU lane]
+ch10:attention [1 GPU lane]
+ch10:batch [1 GPU lane]
+ch10:cluster_group [1 GPU lane]
+ch10:cluster_group_no_dsmem [1 GPU lane]
+ch10:cluster_group_single_cta [1 GPU lane]
+ch10:cluster_multicast [1 GPU lane]
+ch10:cooperative_persistent [1 GPU lane]
+ch10:double_buffered_pipeline [1 GPU lane]
+ch10:dsmem_reduction [1 GPU lane]
+ch10:dsmem_reduction_cluster_atomic [1 GPU lane]
+ch10:dsmem_reduction_v3 [1 GPU lane]
+ch10:dsmem_reduction_warp_specialized [1 GPU lane]
+ch10:flash_attention [1 GPU lane]
+ch10:flash_attn_tma_micro_pipeline [1 GPU lane]
+ch10:flashattention3_pipeline [1 GPU lane]
+ch10:matmul_tcgen05_epilogue [1 GPU lane]
+ch10:matmul_tcgen05_pipelined [1 GPU lane]
+ch10:matmul_tcgen05_vs_cublas [1 GPU lane]
+ch10:persistent_matmul_tma [1 GPU lane]
+ch10:pipeline_3stage [1 GPU lane]
+ch10:tcgen05_cluster_pipeline [1 GPU lane]
+ch10:tcgen05_warp_specialization [1 GPU lane]
+ch10:tcgen05_warp_specialization_cutlass [1 GPU lane]
+ch10:tcgen05_warpgroup_specialization [1 GPU lane]
+ch10:tma_2d_pipeline [1 GPU lane]
+ch10:warp_spec_pingpong [1 GPU lane]
+ch10:warp_specialized_cluster_pipeline [1 GPU lane]
+ch10:warp_specialized_pipeline [1 GPU lane]
+ch10:warp_specialized_pipeline_enhanced [1 GPU lane]
+ch11:adaptive_streams [1 GPU lane]
+ch11:distributed_streams [1 GPU lane]
+ch11:gemm_streams [1 GPU lane]
+ch11:stream_ordered [1 GPU lane]
+ch11:stream_ordered_kv_cache [1 GPU lane]
+ch11:streams [1 GPU lane]
+ch11:tensor_cores_streams [1 GPU lane]
+ch11:warp_specialization_multistream [1 GPU lane]
+ch11:warp_specialized_multistream [1 GPU lane]
+ch11:warp_specialized_two_pipelines_driver [1 GPU lane]
+ch11:warp_specialized_two_pipelines_multistream [1 GPU lane]
+ch12:cuda_graphs [1 GPU lane]
+ch12:cuda_graphs_conditional [1 GPU lane]
+ch12:cuda_graphs_conditional_enhanced [1 GPU lane]
+ch12:cuda_graphs_router [1 GPU lane]
+ch12:dynamic_parallelism_device [1 GPU lane]
+ch12:dynamic_parallelism_host [1 GPU lane]
+ch12:graph_bandwidth [1 GPU lane]
+ch12:graph_conditional_runtime [1 GPU lane]
+ch12:kernel_fusion [1 GPU lane]
+ch12:kernel_fusion_llm_dedicated_stream_and_prefetch_for_blackwell [1 GPU lane]
+ch12:kernel_fusion_llm_persistent_buffer_and_stream_friendly_setup [1 GPU lane]
+ch12:kernel_fusion_llm_reuse_static_tensor_and_simplify_setup [1 GPU lane]
+ch12:kernel_launches [1 GPU lane]
+ch12:nvfp4_mlp [1 GPU lane]
+ch12:uneven_partition [1 GPU lane]
+ch12:uneven_static [1 GPU lane]
+ch12:work_queue [1 GPU lane]
+ch13:arithmetic_intensity [1 GPU lane]
+ch13:attention_sliding_window [1 GPU lane]
+ch13:attention_standard [1 GPU lane]
+ch13:autograd_standard [1 GPU lane]
+ch13:bandwidth_naive [1 GPU lane]
+ch13:dataloader_default [1 GPU lane]
+ch13:fp4_perchannel [1 GPU lane]
+ch13:fp8_perchannel [1 GPU lane]
+ch13:fp8_static [1 GPU lane]
+ch13:kv_cache_naive [1 GPU lane]
+ch13:kv_cache_naive_flash_blockwise [1 GPU lane]
+ch13:kv_cache_naive_pool [1 GPU lane]
+ch13:long_context_attention [1 GPU lane]
+ch13:matmul_pytorch [1 GPU lane]
+ch13:memory_profiling [1 GPU lane]
+ch13:precisionfp8 [1 GPU lane]
+ch13:precisionfp8_pad_inner [1 GPU lane]
+ch13:precisionfp8_pad_inner_matmul [1 GPU lane]
+ch13:precisionfp8_rowwise [1 GPU lane]
+ch13:precisionfp8_rowwise_gw_hp [1 GPU lane]
+ch13:precisionfp8_te [1 GPU lane]
+ch13:precisionmixed [1 GPU lane]
+ch13:quantization [1 GPU lane]
+ch13:regional_compile [1 GPU lane]
+ch13:torchao_quantization [1 GPU lane]
+ch13:torchao_quantization_compiled [1 GPU lane]
+ch13:training_speed [1 GPU lane]
+ch13:training_standard [1 GPU lane]
+ch13:warp_specialization_training [1 GPU lane]
+ch14:attention_eager_sdpa [1 GPU lane]
+ch14:cublas_vs_cutlass [1 GPU lane]
+ch14:cuda_python [1 GPU lane]
+ch14:flex_attention_sparse [1 GPU lane]
+ch14:graph_break_control_flow [1 GPU lane]
+ch14:model_compile_reduced_precision [1 GPU lane]
+ch14:nccl_quantization [1 GPU lane]
+ch14:regional_triton [1 GPU lane]
+ch14:sliding_window [1 GPU lane]
+ch14:triton_persistent [1 GPU lane]
+ch15:allreduce_rmsnorm [1 GPU lane]
+ch15:continuous_batching [1 GPU lane]
+ch15:continuous_batching_multigpu [1 GPU lane]
+ch15:dep2_parallel [1 GPU lane]
+ch15:greedy_sampler [1 GPU lane]
+ch15:guided_decoding [1 GPU lane]
+ch15:inference_monolithic [1 GPU lane]
+ch15:inference_placement [1 GPU lane]
+ch15:kv_cache_management [1 GPU lane]
+ch15:kv_cache_nvlink_pool [1 GPU lane]
+ch15:kv_cache_nvlink_pool_multigpu [1 GPU lane]
+ch15:medusa_eagle_speculative [1 GPU lane]
+ch15:medusa_eagle_speculative_eagle [1 GPU lane]
+ch15:medusa_eagle_speculative_medusa [1 GPU lane]
+ch15:moe_comm_exchange [1 GPU lane]
+ch15:moe_comm_exchange_hierarchical [1 GPU lane]
+ch15:moe_comm_exchange_overlap [1 GPU lane]
+ch15:moe_dispatch [1 GPU lane]
+ch15:moe_inference [1 GPU lane]
+ch15:moe_overlap [1 GPU lane]
+ch15:moe_overlap_local_route [1 GPU lane]
+ch15:moe_overlap_shared_expert [1 GPU lane]
+ch15:moe_routing_topology_aware [1 GPU lane]
+ch15:nvfp4_mlp [1 GPU lane]
+ch15:prefill_decode_disagg [1 GPU lane]
+ch15:prefill_decode_disagg_multigpu [1 GPU lane]
+ch15:single_gpu_kv_handoff [1 GPU lane]
+ch15:speculative_decoding [1 GPU lane]
+ch15:wide_ep [1 GPU lane]
+ch16:awq_gptq_smoothquant [1 GPU lane]
+ch16:awq_gptq_smoothquant_awq [1 GPU lane]
+ch16:awq_gptq_smoothquant_gptq [1 GPU lane]
+ch16:awq_gptq_smoothquant_smoothquant [1 GPU lane]
+ch16:dense_attention_flash [1 GPU lane]
+ch16:dense_attention_flash_blackwell_variant [1 GPU lane]
+ch16:flash_sdp [1 GPU lane]
+ch16:flashinfer_block_sparse [1 GPU lane]
+ch16:nvfp4_mlp [1 GPU lane]
+ch16:piece_graphs [1 GPU lane]
+ch16:regional_compilation [1 GPU lane]
+ch16:runtime_scheduler [1 GPU lane]
+ch17:dynamic_routing [1 GPU lane]
+ch17:inference_full [1 GPU lane]
+ch17:memory [1 GPU lane]
+ch17:moe_router_local_capacity [1 GPU lane]
+ch17:moe_router_uniform [1 GPU lane]
+ch17:moe_router_uniform_topology [1 GPU lane]
+ch17:nvfp4_mlp [1 GPU lane]
+ch17:pipeline_parallelism [1 GPU lane]
+ch17:prefill_decode_disagg [1 GPU lane]
+ch17:prefill_decode_disagg_batched_multigpu [1 GPU lane]
+ch17:prefill_decode_disagg_overlap_multigpu [1 GPU lane]
+ch17:prefill_decode_disagg_tpot_long [1 GPU lane]
+ch17:prefill_decode_disagg_tpot_long_multigpu [1 GPU lane]
+ch17:prefill_decode_disagg_ttft [1 GPU lane]
+ch17:prefill_decode_disagg_ttft_multigpu [1 GPU lane]
+ch17:routing_static [1 GPU lane]
+ch18:cudagraph_bucketing [1 GPU lane]
+ch18:eos_early_exit [1 GPU lane]
+ch18:eos_sync_polling [1 GPU lane]
+ch18:flexattention_sliding_window [1 GPU lane]
+ch18:flexdecoding [1 GPU lane]
+ch18:flexdecoding_graphs [1 GPU lane]
+ch18:paged_attn_backend [1 GPU lane]
+ch18:paged_attn_layout [1 GPU lane]
+ch18:rope_q_cache [1 GPU lane]
+ch18:tensor_cores [1 GPU lane]
+ch18:tiny_gemm_fused [1 GPU lane]
+ch18:vllm_decode_graphs [1 GPU lane]
+ch18:vllm_v1_integration [1 GPU lane]
+ch19:adaptive_parallelism [1 GPU lane]
+ch19:dynamic_precision [1 GPU lane]
+ch19:dynamic_quantized_cache [1 GPU lane]
+ch19:dynamic_quantized_cache_coalesced [1 GPU lane]
+ch19:fp4_hardware_kernel [1 GPU lane]
+ch19:fp4_weight_quantization [1 GPU lane]
+ch19:kv_prefetch_overlap [1 GPU lane]
+ch19:memory_double_buffering [1 GPU lane]
+ch19:mxfp8_moe [1 GPU lane]
+ch19:nvfp4_training [1 GPU lane]
+ch19:vectorization_memory [1 GPU lane]
+ch20:autotuning [1 GPU lane]
+ch20:bf16_mlp [1 GPU lane]
+ch20:end_to_end_bandwidth [1 GPU lane]
+ch20:integrated_kv_cache [1 GPU lane]
+ch20:memory_standard [1 GPU lane]
+ch20:moe [1 GPU lane]
+ch20:nvfp4_mlp [1 GPU lane]
+ch20:pipeline_sequential [1 GPU lane]
+ch20:training_single [1 GPU lane]
+labs/async_input_pipeline:async_input_pipeline [1 GPU lane]
+labs/blackwell_gemm_optimizations:blackwell_grouped_gemm [1 GPU lane]
+labs/blackwell_gemm_optimizations:blackwell_grouped_gemm_full_stack [1 GPU lane]
+labs/blackwell_gemm_optimizations:blackwell_grouped_gemm_large_tiles [1 GPU lane]
+labs/blackwell_gemm_optimizations:blackwell_grouped_gemm_persistent [1 GPU lane]
+labs/blackwell_matmul:blackwell_matmul [1 GPU lane]
+labs/blackwell_matmul:blackwell_matmul_cluster [1 GPU lane]
+labs/blackwell_matmul:blackwell_matmul_pipeline [1 GPU lane]
+labs/blackwell_matmul:blackwell_matmul_tcgen05 [1 GPU lane]
+labs/blackwell_matmul:blackwell_matmul_tma [1 GPU lane]
+labs/block_scaling:block_scaling [1 GPU lane]
+labs/cache_aware_disagg_inference:cache_aware_disagg [1 GPU lane]
+labs/cache_aware_disagg_inference:cache_aware_disagg_multigpu [1 GPU lane]
+labs/cudnn_sdpa_bench:flash_sdp [1 GPU lane]
+labs/custom_vs_cublas:tcgen05_matmul [1 GPU lane]
+labs/decode_optimization:decode [1 GPU lane]
+labs/decode_optimization:decode_candidate_logits [1 GPU lane]
+labs/decode_optimization:decode_compile [1 GPU lane]
+labs/decode_optimization:decode_device_resident [1 GPU lane]
+labs/decode_optimization:decode_double_buffer_tma [1 GPU lane]
+labs/decode_optimization:decode_fp4 [1 GPU lane]
+labs/decode_optimization:decode_fp8 [1 GPU lane]
+labs/decode_optimization:decode_graph [1 GPU lane]
+labs/decode_optimization:decode_graph_full [1 GPU lane]
+labs/decode_optimization:decode_hf_cache [1 GPU lane]
+labs/decode_optimization:decode_pinned [1 GPU lane]
+labs/decode_optimization:decode_prefix_state_cache [1 GPU lane]
+labs/decode_optimization:decode_streams [1 GPU lane]
+labs/decode_optimization:decode_ultimate [1 GPU lane]
+labs/decode_optimization:decode_warp_specialized [1 GPU lane]
+labs/dynamic_router:dual_pool_vllm [1 GPU lane]
+labs/dynamic_router:dynamic_router_vllm [1 GPU lane]
+labs/flashattention4:best_available_attention [1 GPU lane]
+labs/flashattention4:best_available_attention_alibi [1 GPU lane]
+labs/flashattention4:best_available_attention_alibi_windowed [1 GPU lane]
+labs/flashattention4:best_available_attention_causal [1 GPU lane]
+labs/flashattention4:best_available_attention_dense [1 GPU lane]
+labs/flashattention4:best_available_attention_softcap [1 GPU lane]
+labs/flashattention4:best_available_attention_windowed [1 GPU lane]
+labs/flashattention4:flashattention4 [1 GPU lane]
+labs/flashattention4:flashattention4_alibi [1 GPU lane]
+labs/flashattention4:flashattention4_alibi_windowed [1 GPU lane]
+labs/flashattention4:flashattention4_causal [1 GPU lane]
+labs/flashattention4:flashattention4_dense [1 GPU lane]
+labs/flashattention4:flashattention4_softcap [1 GPU lane]
+labs/flashattention4:flashattention4_windowed [1 GPU lane]
+labs/flashattention_gluon:flashattention_gluon [1 GPU lane]
+labs/flashinfer_attention:flashinfer_attention [1 GPU lane]
+labs/flexattention:flex_attention [1 GPU lane]
+labs/fullstack_cluster:cluster_gemm [1 GPU lane]
+labs/fullstack_cluster:cluster_gemm_tcgen05 [1 GPU lane]
+labs/fullstack_cluster:cluster_gemm_tcgen05_cta2 [1 GPU lane]
+labs/fullstack_cluster:moe_hybrid_ep [1 GPU lane]
+labs/fullstack_cluster:moe_hybrid_ep_multigpu [1 GPU lane]
+labs/kv_cache_compression:kv_cache [1 GPU lane]
+labs/kv_cache_compression:kv_cache_nvfp4 [1 GPU lane]
+labs/kv_optimization:kv_standard [1 GPU lane]
+labs/memory_bandwidth_patterns:bandwidth_patterns [1 GPU lane]
+labs/moe_cuda:decode_attention [1 GPU lane]
+labs/moe_cuda:decode_kernel [1 GPU lane]
+labs/moe_cuda:kv_transfer [1 GPU lane]
+labs/moe_cuda:kv_transfer_direct [1 GPU lane]
+labs/moe_cuda:kv_transfer_direct_graphs [1 GPU lane]
+labs/moe_cuda:kv_transfer_graphs [1 GPU lane]
+labs/moe_cuda:moe_backend_selection [1 GPU lane]
+labs/moe_cuda:router [1 GPU lane]
+labs/moe_cuda:router_vectorized [1 GPU lane]
+labs/moe_cuda_ptx:moe_grouped_gemm_bwd [1 GPU lane]
+labs/moe_cuda_ptx:moe_grouped_gemm_fwd [1 GPU lane]
+labs/moe_cuda_ptx:moe_layer [1 GPU lane]
+labs/moe_cuda_ptx:moe_quant [1 GPU lane]
+labs/moe_optimization_journey:moe [1 GPU lane]
+labs/moe_optimization_journey:moe_batched [1 GPU lane]
+labs/moe_optimization_journey:moe_bmm_fusion [1 GPU lane]
+labs/moe_optimization_journey:moe_compiled [1 GPU lane]
+labs/moe_optimization_journey:moe_cuda_graphs [1 GPU lane]
+labs/moe_optimization_journey:moe_expert_parallel [1 GPU lane]
+labs/moe_optimization_journey:moe_fp8 [1 GPU lane]
+labs/moe_optimization_journey:moe_fused [1 GPU lane]
+labs/moe_optimization_journey:moe_grouped [1 GPU lane]
+labs/moe_optimization_journey:moe_memefficient [1 GPU lane]
+labs/moe_optimization_journey:moe_pad_quant [1 GPU lane]
+labs/moe_optimization_journey:moe_parallel [1 GPU lane]
+labs/moe_optimization_journey:moe_permuted [1 GPU lane]
+labs/moe_optimization_journey:moe_sorted [1 GPU lane]
+labs/moe_optimization_journey:moe_streams [1 GPU lane]
+labs/moe_optimization_journey:moe_triton [1 GPU lane]
+labs/nanochat_fullstack:nanochat_inference [1 GPU lane]
+labs/nccl_nixl_nvshmem:tier_handoff [1 GPU lane]
+labs/nvfp4_dual_gemm:nvfp4_dual_gemm [1 GPU lane]
+labs/nvfp4_gemm:nvfp4_gemm [1 GPU lane]
+labs/nvfp4_gemv:nvfp4_gemv [1 GPU lane]
+labs/nvfp4_group_gemm:nvfp4_group_gemm [1 GPU lane]
+labs/nvfp4_group_gemm:nvfp4_group_gemm_g2_n3072_k4096 [1 GPU lane]
+labs/nvfp4_group_gemm:nvfp4_group_gemm_g2_n4096_k1536 [1 GPU lane]
+labs/nvfp4_group_gemm:nvfp4_group_gemm_g8_n4096_k7168 [1 GPU lane]
+labs/nvfp4_group_gemm:nvfp4_group_gemm_g8_n7168_k2048 [1 GPU lane]
+labs/occupancy_tuning:proton_matmul [1 GPU lane]
+labs/occupancy_tuning:proton_matmul_bm128_bn128_bk32_nw8 [1 GPU lane]
+labs/occupancy_tuning:proton_matmul_bm128_bn256_bk64 [1 GPU lane]
+labs/occupancy_tuning:proton_matmul_bm256_bn256_bk64 [1 GPU lane]
+labs/occupancy_tuning:proton_matmul_bm64_bn256_bk32 [1 GPU lane]
+labs/occupancy_tuning:proton_matmul_bm64_bn64_bk32_nw2 [1 GPU lane]
+labs/ozaki_scheme:ozaki_scheme [1 GPU lane]
+labs/ozaki_scheme:ozaki_scheme_dynamic [1 GPU lane]
+labs/ozaki_scheme:ozaki_scheme_fixed [1 GPU lane]
+labs/parameterized_cuda_graphs:parameterized_graph_launch [1 GPU lane]
+labs/persistent_decode:native_tma_prefill_decode [1 GPU lane]
+labs/persistent_decode:nvlink_offload [1 GPU lane]
+labs/persistent_decode:paged_kv_offload [1 GPU lane]
+labs/persistent_decode:paged_kv_offload_prefetch [1 GPU lane]
+labs/persistent_decode:persistent_decode [1 GPU lane]
+labs/persistent_decode:persistent_decode_cuda [1 GPU lane]
+labs/persistent_decode:persistent_decode_full_and_piecewise [1 GPU lane]
+labs/persistent_decode:persistent_decode_graphs [1 GPU lane]
+labs/persistent_decode:persistent_decode_triton [1 GPU lane]
+labs/persistent_decode:right_sized_decode [1 GPU lane]
+labs/persistent_decode:tma_prefill_decode [1 GPU lane]
+labs/real_world_models:llama_3_1_8b [1 GPU lane]
+labs/recsys_sequence_ranking:sequence_ranking [1 GPU lane]
+labs/software_pipelining:tile_pipeline [1 GPU lane]
+labs/speculative_decode:speculative_decode [1 GPU lane]
+labs/speculative_decode:speculative_decode_transition_table [1 GPU lane]
+labs/speculative_decode:speculative_decode_trusted [1 GPU lane]
+labs/top_k_kernel:top_k_kernel [1 GPU lane]
+labs/top_k_kernel:top_k_kernel_cuda [1 GPU lane]
+labs/train_distributed:ddp [1 GPU lane]
+labs/train_distributed:ddp_compression [1 GPU lane]
+labs/train_distributed:ddp_compression_int8 [1 GPU lane]
+labs/train_distributed:ddp_compression_multigpu_int8 [1 GPU lane]
+labs/train_distributed:ddp_compression_multigpu_powersgd [1 GPU lane]
+labs/train_distributed:ddp_compression_powersgd [1 GPU lane]
+labs/train_distributed:ddp_flash [1 GPU lane]
+labs/train_distributed:ddp_flash_multigpu [1 GPU lane]
+labs/train_distributed:ddp_multigpu [1 GPU lane]
+labs/train_distributed:fsdp [1 GPU lane]
+labs/train_distributed:fsdp2 [1 GPU lane]
+labs/train_distributed:fsdp2_multigpu [1 GPU lane]
+labs/train_distributed:fsdp_multigpu [1 GPU lane]
+labs/train_distributed:pipeline_1f1b [1 GPU lane]
+labs/train_distributed:pipeline_1f1b_multigpu [1 GPU lane]
+labs/train_distributed:pipeline_1f1b_to_gpipe_multigpu [1 GPU lane]
+labs/train_distributed:pipeline_dualpipe [1 GPU lane]
+labs/train_distributed:pipeline_dualpipe_multigpu [1 GPU lane]
+labs/train_distributed:pipeline_dualpipev [1 GPU lane]
+labs/train_distributed:pipeline_dualpipev_multigpu [1 GPU lane]
+labs/train_distributed:pipeline_gpipe [1 GPU lane]
+labs/train_distributed:pipeline_gpipe_multigpu [1 GPU lane]
+labs/train_distributed:pipeline_gpipe_to_dualpipe_multigpu [1 GPU lane]
+labs/train_distributed:pipeline_gpipe_to_dualpipev_multigpu [1 GPU lane]
+labs/train_distributed:symmem_training [1 GPU lane]
+labs/train_distributed:symmem_training_multigpu [1 GPU lane]
+labs/train_distributed:zero1 [1 GPU lane]
+labs/train_distributed:zero1_multigpu [1 GPU lane]
+labs/train_distributed:zero2 [1 GPU lane]
+labs/train_distributed:zero2_multigpu [1 GPU lane]
+labs/train_distributed:zero3 [1 GPU lane]
+labs/train_distributed:zero3_multigpu [1 GPU lane]
+labs/training_hotpath:metric_reduction_cuda [1 GPU lane]
+labs/training_hotpath:metric_reduction_vectorized [1 GPU lane]
+labs/training_hotpath:padding_aware_transformer [1 GPU lane]
+labs/trtllm_phi_3_5_moe:trtllm_phi_3_5_moe [1 GPU lane]
+ch02:memory_transfer_multigpu [2 GPU lane]
+ch04:gradient_fusion_multigpu [2 GPU lane]
+ch04:nvshmem_pipeline_parallel_multigpu [2 GPU lane]
+ch04:nvshmem_training_example_multigpu [2 GPU lane]
+ch04:nvshmem_training_patterns_multigpu [2 GPU lane]
+ch04:nvshmem_vs_nccl_benchmark_multigpu [2 GPU lane]
+ch04:pipeline_parallel [2 GPU lane]
+ch04:pipeline_parallel_1f1b [2 GPU lane]
+ch04:pipeline_parallel_multigpu [2 GPU lane]
+ch04:pipeline_parallel_multigpu_1f1b [2 GPU lane]
+ch04:symmetric_memory_multigpu [2 GPU lane]
+ch04:symmetric_memory_perf_multigpu [2 GPU lane]
+ch04:tensor_parallel [2 GPU lane]
+ch04:tensor_parallel_allgather_multigpu [2 GPU lane]
+ch04:tensor_parallel_async [2 GPU lane]
+ch04:tensor_parallel_multigpu [2 GPU lane]
+ch04:torchcomms [2 GPU lane]
+ch04:torchcomms_multigpu [2 GPU lane]
+ch13:context_parallel_multigpu [2 GPU lane]
+ch13:expert_parallel_multigpu [2 GPU lane]
+ch13:sequence_parallel_multigpu [2 GPU lane]
+ch15:disaggregated_inference_multigpu [2 GPU lane]
+```
